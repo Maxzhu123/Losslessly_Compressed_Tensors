@@ -40,7 +40,7 @@ Compress a BF16 tensor, restore it, and compare the underlying bits:
 import torch
 
 from LCT.comp_format import DistType, Distribution
-from LCT.compress import compress, decompress
+from LCT.operations import compress, decompress
 
 x = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
 distribution = Distribution(DistType.GAUSSIAN)
@@ -123,7 +123,7 @@ Triton remains required for supporting kernels. Set `use_tilelang = False` to us
 
 | Module | Purpose |
 | --- | --- |
-| [`compress.py`](LCT/compress.py) | Compression, decompression, and operations on compressed tensors |
+| [`operations.py`](LCT/operations.py) | Compression, decompression, and operations on compressed tensors |
 | [`comp_format.py`](LCT/comp_format.py) | Distribution and storage-layout configuration |
 | [`config.py`](LCT/config.py) | Backend selection and runtime settings |
 | [`comp_tensor.py`](LCT/comp_tensor.py) | `CompressedTensor` storage, memory accounting, and buffer release |

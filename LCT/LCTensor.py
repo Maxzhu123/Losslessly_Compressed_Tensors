@@ -5,7 +5,7 @@ from torch import Tensor
 
 from .comp_format import Distribution
 from .comp_tensor import CompressedTensor
-from .compress import compress, decompress, compA_add_B, a_compA_add_B, a_compA_add_b_B, a_compA_add_compB
+from .operations import compress, decompress, compA_add_B, a_compA_add_B, a_compA_add_b_B, a_compA_add_compB
 from .tensor_buffer import TensorBuffer
 
 

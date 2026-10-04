@@ -15,7 +15,7 @@ if __package__ in (None, ""):
 from examples.benchmarks.benchmark_lct import make_empirical, make_gaussian, make_laplace
 from LCT.comp_format import DistType, Distribution
 from LCT.comp_tensor import CompressedTensor
-from LCT.compress import (
+from LCT.operations import (
     compress, decompress, compA_add_B, compA_mul_B,
     a_compA_add_B, a_compA_add_b_B, a_compA_add_compB,
 )

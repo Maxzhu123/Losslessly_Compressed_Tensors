@@ -4,7 +4,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from LCT.LCTensor import LCTTensor
-from LCT.compress import compress, decompress
+from LCT.operations import compress, decompress
 from LCT.components.dist_configs import weight_dist, act_dist, act_relu_dist
 from LCT.components.ops import rms_norm, rms_norm_backward
 

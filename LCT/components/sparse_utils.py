@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 
 from LCT.LCTensor import LCTTensor
-from LCT.compress import a_compA_add_B
+from LCT.operations import a_compA_add_B
 from LCT.components.dist_configs import momentum_dist, momentum_first_dist
 if TYPE_CHECKING:
     from LCT.tensor_buffer import TensorBuffer

@@ -9,7 +9,7 @@ import torch
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from LCT.compress import compress, decompress
+from LCT.operations import compress, decompress
 from LCT.tensor_buffer import TensorBuffer
 from LCT.comp_format import DistType, Distribution, NoiseLevel
 

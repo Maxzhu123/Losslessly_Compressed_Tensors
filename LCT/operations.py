@@ -1,4 +1,4 @@
-"""Public lossless BF16 compression and decompression API."""
+"""Public lossless BF16 compression, decompression, and tensor operations API."""
 from typing import TYPE_CHECKING
 import torch
 
