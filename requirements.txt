@@ -1,0 +1,11 @@
+torch
+numpy
+transformers
+git+https://github.com/Maccy-Z/c_print.git
+tqdm
+tabulate
+scipy
+matplotlib
+safetensors
+tilelang
+tabulate
