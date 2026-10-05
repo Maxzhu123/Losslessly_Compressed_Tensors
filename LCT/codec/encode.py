@@ -13,7 +13,7 @@ from ..kernels.common.tables import (
 )
 from ..kernels.generic.compaction import (
     _count_bad_streams_kernel, _compact_bad_streams_kernel,
-    _compact_extra_kernel, _compact_components_extra_kernel,
+    _compact_extra_kernel,
 )
 from ..kernels.generic.metadata import _prefix_allocate_kernel, _compact_metadata_kernel
 from ..kernels import dispatch
@@ -54,12 +54,11 @@ def _compact_extra(
     def compact_grid(meta):
         return (min(triton.cdiv(streams, meta["TILE"]), COMPACT_GRID_LIMIT),)
 
-    kernel = _compact_components_extra_kernel if precomputed else _compact_extra_kernel
-    kernel[compact_grid](
+    _compact_extra_kernel[compact_grid](
         source_values, bad_streams, bad_starts, fallback_offsets,
         fallback_data, metadata_buffer, allocation_descriptor,
         final_counts, bad_count, size,
-        BUFFERED=buffered, LOGICAL_NUMEL=logical_numel,
+        BUFFERED=buffered, PRECOMPUTED=precomputed, LOGICAL_NUMEL=logical_numel,
         BLOCK=block_symbols, N_LANES=lanes, N_STEPS=steps,
     )
 
@@ -104,7 +103,7 @@ def encode_components(
         _estimate_and_shift_encoding_table_kernel[(1,)](
             source_values, center, logical_numel, encode_table, shifted_encode,
             SAMPLE_SIZE=min(logical_numel, CENTER_SAMPLE_SIZE),
-            PRECOMPUTED=precomputed, IGNORE_ZERO=distribution.zero_prob > 0,
+            PRECOMPUTED=precomputed,
             BLOCK=4096, num_warps=4, num_stages=2,
         )
     else:

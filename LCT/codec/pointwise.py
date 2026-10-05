@@ -1,11 +1,11 @@
 """Registry-driven pointwise operations for compressed tensors."""
-
+from typing import TYPE_CHECKING
 from dataclasses import dataclass
 import torch
 import triton
 
 from ..comp_tensor import CompressedTensor
-from ..comp_format import StorageLayout
+from ..comp_format import Distribution, StorageLayout
 from ..compression.huffman_tables import FIRST_BITS, FIRST_MASK, get_distribution_tables
 from .autotune import SCATTER_GRID_LIMIT
 from .encode import encode as compress_dense, encode_components as compress_components
@@ -13,15 +13,10 @@ from .decode import decode as decode_dense
 from .geometry import geometry
 from ..kernels.common.tables import _shift_decoding_table_kernel
 from ..kernels.generic.pointwise import (
-    COMPRESSED_OUTPUT,
-    DENSE_OUTPUT,
+    COMPRESSED_OUTPUT, DENSE_OUTPUT,
     pointwise_compressed_dense_fallback_kernel,
     pointwise_compressed_dense_kernel,
-    add_op, multiply_op
-)
-from ..kernels.generic.pointwise_scalar import (
-    pointwise_scalar_mul_add_dense_fallback_kernel,
-    pointwise_scalar_mul_add_dense_kernel,
+    add_op, multiply_op, _scaled_sum,
 )
 from ..kernels.generic.pointwise_scalar_dual import (
     _initialize_dual_maps_kernel,
@@ -29,10 +24,31 @@ from ..kernels.generic.pointwise_scalar_dual import (
     pointwise_scalar_mul_add_compressed_compressed_mapped_kernel,
 )
 from ..tensor_buffer import TensorBuffer
+if TYPE_CHECKING:
+    from torch import Tensor
+    from triton import language as tl
 
 
-def _launch_pointwise_compressed_dense(data, other, operation, output_policy):
-    """Launch the fixed-stream operation, then correct sparse fallback tails."""
+def _launch_pointwise_compressed_dense(
+    data: CompressedTensor, other: Tensor,
+    operation: PointwiseOp, output_policy: tl.constexpr,
+    *,
+    alpha: Tensor | None = None, beta: Tensor | None = None, alpha_is_one: bool = False,
+):
+    """ alpha * compA + beta * B
+        Elementwise. alpha=1 and beta=1 special cases.
+    """
+    # Normalize arithmetic and unit scalars once for both kernels.
+    scaled = operation.name == "scalar_mul_add"
+    operation_args = (alpha, beta) if scaled else (None, None)
+    operation_meta = dict(
+        OP=_scaled_sum if scaled else operation.triton_fn,
+        SCALED=scaled,
+        ALPHA_IS_ONE=not scaled or alpha_is_one,
+        BETA_IS_ONE=not scaled or beta is None,
+    )
+
+    # Prepare the decode table and flattened dense operand.
     other = other.contiguous().view(-1)
     _, decode_table, rare_length = get_distribution_tables(data.distribution)
     shifted_decode = torch.empty(
@@ -44,6 +60,7 @@ def _launch_pointwise_compressed_dense(data, other, operation, output_policy):
     )
     block_symbols, lanes, steps, fixed_words = data.codec_geometry
     blocks = triton.cdiv(data.size, block_symbols)
+    # Allocate dense values or the components consumed by the encoder.
     if output_policy == DENSE_OUTPUT:
         output = torch.empty(
             data.logical_numel,
@@ -56,12 +73,14 @@ def _launch_pointwise_compressed_dense(data, other, operation, output_policy):
         )
         auxiliary = torch.empty_like(output)
 
+    # Decode fixed streams and apply the selected operation.
     main_args = (
         data.data, data.sign_mantissa, other, output, auxiliary,
         shifted_decode, data.size, blocks * lanes, data.center,
+        *operation_args,
     )
     main_meta = dict(
-        OP=operation.triton_fn, OUTPUT_POLICY=output_policy,
+        **operation_meta, OUTPUT_POLICY=output_policy,
         FIRST_MASK=FIRST_MASK, RARE_LENGTH=rare_length,
         BLOCK=block_symbols, N_LANES=lanes, N_STEPS=steps,
         FIXED_WORDS=fixed_words,
@@ -69,15 +88,17 @@ def _launch_pointwise_compressed_dense(data, other, operation, output_policy):
     pointwise_compressed_dense_kernel[(blocks,)](
         *main_args, LOGICAL_NUMEL=data.logical_numel, **main_meta,
     )
+    # Correct overflow rows using the input's fallback storage layout.
     if data.fallback_descriptor is not None:
         metadata = data.fallback_buffer.view(torch.int32)
         fallback_args = (
             metadata, data.fallback_buffer, metadata, data.fallback_buffer, 0,
             metadata, data.fallback_descriptor, data.fallback_count,
             data.sign_mantissa, other, output, auxiliary, data.size,
+            *operation_args,
         )
         fallback_meta = dict(
-            OP=operation.triton_fn, OUTPUT_POLICY=output_policy,
+            **operation_meta, OUTPUT_POLICY=output_policy,
             BUFFERED=True, TILE=64, BLOCK=block_symbols,
             N_LANES=lanes, N_STEPS=steps,
         )
@@ -91,9 +112,10 @@ def _launch_pointwise_compressed_dense(data, other, operation, output_policy):
             data.fallback_buffer, data.fallback_base, data.offsets,
             data.offsets, data.fallback_count, data.sign_mantissa,
             other, output, auxiliary, data.size,
+            *operation_args,
         )
         fallback_meta = dict(
-            OP=operation.triton_fn, OUTPUT_POLICY=output_policy,
+            **operation_meta, OUTPUT_POLICY=output_policy,
             BUFFERED=False, TILE=64, BLOCK=block_symbols,
             N_LANES=lanes, N_STEPS=steps,
         )
@@ -104,91 +126,13 @@ def _launch_pointwise_compressed_dense(data, other, operation, output_policy):
     return output, auxiliary
 
 
-def _launch_scalar_mul_add_compressed_dense(
-    data, other, alpha, output_policy, beta=None, alpha_is_one=False,
-):
-    """Launch the dedicated fused scalar multiply-add pointwise kernels."""
-    other = other.contiguous().view(-1)
-    _, decode_table, rare_length = get_distribution_tables(data.distribution)
-    shifted_decode = torch.empty(
-        1 << FIRST_BITS, dtype=torch.int32, device=data.data.device,
-    )
-    _shift_decoding_table_kernel[(1,)](
-        decode_table, data.center, shifted_decode,
-        BLOCK=1 << FIRST_BITS,
-    )
-    block_symbols, lanes, steps, fixed_words = data.codec_geometry
-    blocks = triton.cdiv(data.size, block_symbols)
-    if output_policy == DENSE_OUTPUT:
-        output = torch.empty(
-            data.logical_numel,
-            dtype=torch.bfloat16, device=data.data.device,
-        )
-        auxiliary = output
-    else:
-        output = torch.empty(
-            data.size, dtype=torch.uint8, device=data.data.device
-        )
-        auxiliary = torch.empty_like(output)
-
-    main_args = (
-        data.data, data.sign_mantissa, other, output, auxiliary,
-        shifted_decode, data.size, blocks * lanes, data.center, alpha, beta,
-    )
-    main_meta = dict(
-        SCALE_OTHER=beta is not None,
-        ALPHA_IS_ONE=alpha_is_one,
-        OUTPUT_POLICY=output_policy,
-        FIRST_MASK=FIRST_MASK, RARE_LENGTH=rare_length,
-        BLOCK=block_symbols, N_LANES=lanes, N_STEPS=steps,
-        FIXED_WORDS=fixed_words,
-    )
-    pointwise_scalar_mul_add_dense_kernel[(blocks,)](
-        *main_args, LOGICAL_NUMEL=data.logical_numel, **main_meta,
-    )
-    if data.fallback_descriptor is not None:
-        metadata = data.fallback_buffer.view(torch.int32)
-        fallback_args = (
-            metadata, data.fallback_buffer, metadata, data.fallback_buffer, 0,
-            metadata, data.fallback_descriptor, data.fallback_count,
-            data.sign_mantissa, other, output, auxiliary, data.size, alpha, beta,
-        )
-        fallback_meta = dict(
-            SCALE_OTHER=beta is not None,
-            ALPHA_IS_ONE=alpha_is_one,
-            OUTPUT_POLICY=output_policy,
-            BUFFERED=True, TILE=64, BLOCK=block_symbols,
-            N_LANES=lanes, N_STEPS=steps,
-        )
-        fallback_grid = (min(triton.cdiv(blocks * lanes, 64), SCATTER_GRID_LIMIT),)
-        pointwise_scalar_mul_add_dense_fallback_kernel[fallback_grid](
-            *fallback_args, LOGICAL_NUMEL=data.logical_numel, **fallback_meta,
-        )
-    elif data.offsets.numel():
-        fallback_args = (
-            data.offsets, data.fallback_starts, data.fallback_offsets,
-            data.fallback_buffer, data.fallback_base, data.offsets,
-            data.offsets, data.fallback_count, data.sign_mantissa,
-            other, output, auxiliary, data.size, alpha, beta,
-        )
-        fallback_meta = dict(
-            SCALE_OTHER=beta is not None,
-            ALPHA_IS_ONE=alpha_is_one,
-            OUTPUT_POLICY=output_policy,
-            BUFFERED=False, TILE=64, BLOCK=block_symbols,
-            N_LANES=lanes, N_STEPS=steps,
-        )
-        fallback_grid = (min(triton.cdiv(data.offsets.numel(), 64), SCATTER_GRID_LIMIT),)
-        pointwise_scalar_mul_add_dense_fallback_kernel[fallback_grid](
-            *fallback_args, LOGICAL_NUMEL=data.logical_numel, **fallback_meta,
-        )
-    return output, auxiliary
-
-
 def _launch_scalar_mul_add_compressed_compressed(
-    data, other, alpha, output_policy,
+    data: CompressedTensor, other: CompressedTensor, alpha: Tensor,
+    output_policy: tl.constexpr,
 ):
-    """Prepare fallback maps, then decode and compute both compressed operands."""
+    """ alpha * compA + compB
+        Elementwise. Dense BF16 values or components for recompression.
+    """
     _, a_decode_table, rare_length_a = get_distribution_tables(data.distribution)
     _, b_decode_table, rare_length_b = get_distribution_tables(other.distribution)
     if rare_length_a != rare_length_b:
@@ -284,18 +228,14 @@ def _launch_scalar_mul_add_compressed_compressed(
 
 
 def pointwise_scale_add_compressed(
-    data: CompressedTensor,
-    other: CompressedTensor,
-    alpha: torch.Tensor,
+    data: CompressedTensor, other: CompressedTensor, alpha: Tensor,
     *,
     dense_output: bool = True,
     buffer: TensorBuffer | None = None,
-    distribution=None,
-) -> torch.Tensor | CompressedTensor:
-    """Apply ``alpha * data + other`` where both operands are compressed.
-
-    Uses one fused decode/compute pass for blocked operands with the same
-    geometry, including both private and buffered fallback storage.
+    distribution: Distribution | None = None,
+) -> Tensor | CompressedTensor:
+    """ alpha * compA + compB
+        Elementwise. Dense BF16 or compressed output.
     """
     same_layout = (
         data.layout == StorageLayout.COMPRESSED
@@ -342,21 +282,16 @@ def pointwise_scale_add_compressed(
 
 
 def pointwise_compressed_dense(
-    data: CompressedTensor,
-    other: torch.Tensor,
-    operation: PointwiseOp,
+    data: CompressedTensor,  other: Tensor, operation: PointwiseOp,
     *,
-    alpha=None,
-    beta=None,
-    alpha_is_one=False,
+    alpha: Tensor | None = None, beta: Tensor | None = None, alpha_is_one: bool = False,
     dense_output: bool = True,
     buffer: TensorBuffer | None = None,
-    distribution=None,
-) -> torch.Tensor | CompressedTensor:
-    """ Apply a compressed + dense pointwise operation.
-        For scalar_mul_add, optional beta scales the dense operand in FP32.
-        alpha_is_one specializes away the alpha load and multiplication.
-        If dense_output, returns a dense tensor. Otherwise, returns a compressed tensor.
+    distribution: Distribution | None = None,
+) -> Tensor | CompressedTensor:
+    """ alpha * compA + beta * B, or compA * B
+        Elementwise. alpha=1 and beta=1 special cases.
+        Dense BF16 or compressed output.
     """
     # Both tensors must have the same shape.
     if tuple(other.shape) != data.shape:
@@ -398,14 +333,10 @@ def pointwise_compressed_dense(
 
     # Launch the fused pointwise kernel and write dense or component output.
     policy = DENSE_OUTPUT if dense_output else COMPRESSED_OUTPUT
-    if operation.name == "scalar_mul_add":
-        values, auxiliary = _launch_scalar_mul_add_compressed_dense(
-            data, other, alpha, policy, beta=beta, alpha_is_one=alpha_is_one,
-        )
-    else:
-        values, auxiliary = _launch_pointwise_compressed_dense(
-            data, other, operation, policy,
-        )
+    values, auxiliary = _launch_pointwise_compressed_dense(
+        data, other, operation, policy,
+        alpha=alpha, beta=beta, alpha_is_one=alpha_is_one,
+    )
     if dense_output:
         return values.reshape(data.shape)
 
@@ -426,8 +357,11 @@ class PointwiseOp:
     torch_fn: object
 
 
+# Compute compA + B elementwise for additive updates.
 ADD = PointwiseOp("add", add_op, torch.add)
+# Compute compA * B elementwise for per-element scaling.
 MULTIPLY = PointwiseOp("multiply", multiply_op, torch.mul)
+# Compute alpha * compA + B or alpha * compA + beta * B for scaled updates.
 SCALAR_MUL_ADD = PointwiseOp(
     "scalar_mul_add",
     None,

@@ -9,6 +9,7 @@ from ...codec.autotune import (
     DENSE_SCATTER_AUTOTUNE_CONFIGS,
 )
 from ..primitives import pack_bf16
+from .layout import swizzle_lane
 
 
 @triton.autotune(
@@ -126,8 +127,6 @@ def _compact_extra_impl(
         fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0).to(tl.int32)
     block = stream // N_LANES
     lane = stream - block * N_LANES
-    # Hoisted swizzle (see _encode_kernel): block_shift is loop-invariant.
-    block_shift = (block * N_STEPS) & 255
     block_base = block * BLOCK
     # Absolute rows keep adjacent source lanes together even when streams
     # have different overflow starts. Process several rows per iteration.
@@ -141,7 +140,7 @@ def _compact_extra_impl(
             & (row[:, None] < N_STEPS) & (source_offset < n_elements)
         )
         logical_n = block[None, :] * N_STEPS + row[:, None]
-        logical_k = (lane[None, :] + ((block_shift[None, :] + row[:, None]) & 255)) & 255
+        logical_k = swizzle_lane(block[None, :] * N_STEPS, row[:, None], lane[None, :])
         input_offset = logical_n * N_LANES + logical_k
         value = tl.load(
             source_bits + input_offset,
@@ -160,119 +159,29 @@ def _compact_extra_impl(
 
 @triton.autotune(
     configs=COMPACT_EXTRA_AUTOTUNE_CONFIGS,
-    key=["n_elements", "N_LANES", "N_STEPS", "BLOCK"],
-)
-@triton.jit
-def _compact_components_extra_kernel(
-    source_bits, extra_streams, extra_starts,
-    fallback_offsets, fallback_data, metadata_buffer,
-    allocation_descriptor, final_counts, bad_count, n_elements,
-    BUFFERED: tl.constexpr, LOGICAL_NUMEL: tl.constexpr,
-    BLOCK: tl.constexpr, N_LANES: tl.constexpr,
-    N_STEPS: tl.constexpr, TILE: tl.constexpr,
-    ROW_TILE: tl.constexpr,
-):
-    """Compact overflow exponents from flattened precomputed planes."""
-    count = tl.load(final_counts if BUFFERED else bad_count).to(tl.int32)
-    for tile_id in tl.range(tl.program_id(0), tl.cdiv(count, TILE), tl.num_programs(0)):
-        _compact_extra_impl(
-            source_bits, extra_streams, extra_starts, fallback_offsets,
-            fallback_data, metadata_buffer, allocation_descriptor,
-            final_counts, bad_count, n_elements, BUFFERED, True,
-            LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS, TILE, ROW_TILE,
-            tile_id,
-        )
-
-
-@triton.autotune(
-    configs=COMPACT_EXTRA_AUTOTUNE_CONFIGS,
-    key=["n_elements", "N_LANES", "N_STEPS", "BLOCK"],
+    key=["n_elements", "N_LANES", "N_STEPS", "BLOCK", "PRECOMPUTED"],
 )
 @triton.jit
 def _compact_extra_kernel(
     source_bits, extra_streams, extra_starts,
     fallback_offsets, fallback_data, metadata_buffer,
     allocation_descriptor, final_counts, bad_count, n_elements,
-    BUFFERED: tl.constexpr, LOGICAL_NUMEL: tl.constexpr,
+    BUFFERED: tl.constexpr, PRECOMPUTED: tl.constexpr, LOGICAL_NUMEL: tl.constexpr,
     BLOCK: tl.constexpr, N_LANES: tl.constexpr,
     N_STEPS: tl.constexpr, TILE: tl.constexpr,
     ROW_TILE: tl.constexpr,
 ):
-    """Compact flattened overflow values through the 1D source mapping."""
+    """Compact overflow exponents from BF16 bits or precomputed exponent bytes."""
+    # Specialize input extraction while sharing the persistent tile traversal.
     count = tl.load(final_counts if BUFFERED else bad_count).to(tl.int32)
     for tile_id in tl.range(tl.program_id(0), tl.cdiv(count, TILE), tl.num_programs(0)):
         _compact_extra_impl(
             source_bits, extra_streams, extra_starts, fallback_offsets,
             fallback_data, metadata_buffer, allocation_descriptor,
-            final_counts, bad_count, n_elements, BUFFERED, False,
+            final_counts, bad_count, n_elements, BUFFERED, PRECOMPUTED,
             LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS, TILE, ROW_TILE,
             tile_id,
         )
-
-
-@triton.jit
-def _scatter_blocked_fallback_impl(
-    bad_streams, bad_starts, fallback_offsets,
-    fallback_buffer, fallback_base, metadata, descriptor, fallback_count,
-    sign_mantissa, output, n_elements,
-    BUFFERED: tl.constexpr,
-    LOGICAL_NUMEL: tl.constexpr,
-    TILE: tl.constexpr, BLOCK: tl.constexpr,
-    N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
-    ROW_TILE: tl.constexpr, tile_id,
-):
-    """Overwrite mapped decode output with compact fallback stream tails."""
-    pid = tile_id
-    tile = pid * TILE + tl.arange(0, TILE)
-    count = tl.load(fallback_count).to(tl.int32)
-    if pid * TILE >= count:
-        return
-    valid = tile < count
-    if BUFFERED:
-        base = tl.load(descriptor).to(tl.int32)
-        base_words = base // 4
-        stream = tl.load(metadata + base_words + tile, mask=valid, other=0)
-        start = tl.load(
-            bad_starts + base + 8 * count + tile,
-            mask=valid, other=N_STEPS,
-        )
-        fallback_offset = tl.load(
-            metadata + base_words + count + tile, mask=valid, other=0,
-        )
-        fallback_base = base + 9 * count
-    else:
-        stream = tl.load(bad_streams + tile, mask=valid, other=0)
-        start = tl.load(bad_starts + tile, mask=valid, other=N_STEPS)
-        fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0)
-    stream = stream.to(tl.int32)
-    start = start.to(tl.int32)
-    fallback_offset = fallback_offset.to(tl.int32)
-    block = stream // N_LANES
-    lane = stream % N_LANES
-    # Hoisted swizzle (see _encode_kernel): block_shift is loop-invariant.
-    block_shift = (block * N_STEPS) & 255
-    block_base = block * BLOCK
-    # Skip the inactive prefix, then restore several absolute rows at once.
-    first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
-    row_offsets = tl.arange(0, ROW_TILE)
-    for first in tl.range(first_step, N_STEPS, ROW_TILE):
-        row = first + row_offsets
-        storage_offset = block_base[None, :] + row[:, None] * N_LANES + lane[None, :]
-        logical_n = block[None, :] * N_STEPS + row[:, None]
-        logical_k = (lane[None, :] + ((block_shift[None, :] + row[:, None]) & 255)) & 255
-        logical_offset = logical_n * N_LANES + logical_k
-        active = (
-            valid[None, :] & (row[:, None] >= start[None, :])
-            & (row[:, None] < N_STEPS) & (storage_offset < n_elements)
-            & (logical_offset < LOGICAL_NUMEL)
-        )
-        source_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
-        exponent = tl.load(
-            fallback_buffer + fallback_base + source_offset,
-            mask=active, other=0,
-        ).to(tl.int32)
-        sm = tl.load(sign_mantissa + storage_offset, mask=active, other=0)
-        tl.store(output + logical_offset, pack_bf16(exponent, sm).to(tl.int16), mask=active)
 
 
 @triton.autotune(
@@ -290,12 +199,55 @@ def _scatter_blocked_fallback_kernel(
     N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
     ROW_TILE: tl.constexpr,
 ):
+    """Overwrite mapped decode output with compact fallback stream tails."""
     count = tl.load(fallback_count).to(tl.int32)
     for tile_id in tl.range(tl.program_id(0), tl.cdiv(count, TILE), tl.num_programs(0)):
-        _scatter_blocked_fallback_impl(
-            bad_streams, bad_starts, fallback_offsets, fallback_buffer,
-            fallback_base, metadata, descriptor, fallback_count,
-            sign_mantissa, output, n_elements, BUFFERED, LOGICAL_NUMEL,
-            TILE, BLOCK, N_LANES, N_STEPS, ROW_TILE,
-            tile_id,
-        )
+        # Load stream metadata from the selected fallback storage layout.
+        tile = tile_id * TILE + tl.arange(0, TILE)
+        valid = tile < count
+        if BUFFERED:
+            base = tl.load(descriptor).to(tl.int32)
+            base_words = base // 4
+            stream = tl.load(metadata + base_words + tile, mask=valid, other=0)
+            start = tl.load(
+                bad_starts + base + 8 * count + tile,
+                mask=valid, other=N_STEPS,
+            )
+            fallback_offset = tl.load(
+                metadata + base_words + count + tile, mask=valid, other=0,
+            )
+            tail_base = base + 9 * count
+        else:
+            stream = tl.load(bad_streams + tile, mask=valid, other=0)
+            start = tl.load(bad_starts + tile, mask=valid, other=N_STEPS)
+            fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0)
+            tail_base = fallback_base
+
+        # Skip inactive prefixes, then restore several absolute rows at once.
+        stream = stream.to(tl.int32)
+        start = start.to(tl.int32)
+        fallback_offset = fallback_offset.to(tl.int32)
+        block = stream // N_LANES
+        lane = stream % N_LANES
+        block_base = block * BLOCK
+        first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
+        row_offsets = tl.arange(0, ROW_TILE)
+        for first in tl.range(first_step, N_STEPS, ROW_TILE):
+            row = first + row_offsets
+            storage_offset = block_base[None, :] + row[:, None] * N_LANES + lane[None, :]
+            logical_n = block[None, :] * N_STEPS + row[:, None]
+            logical_k = swizzle_lane(block[None, :] * N_STEPS, row[:, None], lane[None, :])
+            logical_offset = logical_n * N_LANES + logical_k
+            active = (
+                valid[None, :] & (row[:, None] >= start[None, :])
+                & (row[:, None] < N_STEPS) & (storage_offset < n_elements)
+                & (logical_offset < LOGICAL_NUMEL)
+            )
+            # Reassemble BF16 bits and write only active logical elements.
+            source_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
+            exponent = tl.load(
+                fallback_buffer + tail_base + source_offset,
+                mask=active, other=0,
+            ).to(tl.int32)
+            sm = tl.load(sign_mantissa + storage_offset, mask=active, other=0)
+            tl.store(output + logical_offset, pack_bf16(exponent, sm).to(tl.int16), mask=active)

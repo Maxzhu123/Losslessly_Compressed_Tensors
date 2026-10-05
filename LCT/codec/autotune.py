@@ -6,9 +6,6 @@ import triton
 from ..kernels.device import device_profile
 
 
-ESTIMATE_CENTER_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK": 4096}, num_warps=4, num_stages=2),
-]
 ENCODE_AUTOTUNE_CONFIGS = [
     triton.Config({}, num_warps=8, num_stages=2),
     triton.Config({}, num_warps=8, num_stages=1, maxnreg=32),

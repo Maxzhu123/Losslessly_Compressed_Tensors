@@ -4,6 +4,7 @@ import triton
 from triton import language as tl
 
 from ...codec.autotune import ENCODE_AUTOTUNE_CONFIGS
+from .layout import swizzle_lane
 
 
 @triton.autotune(
@@ -22,9 +23,7 @@ def _encode_kernel(
 ):
     """Encode one flattened contiguous block per program (1D storage).
 
-    Storage offset ``block * BLOCK + step * N_LANES + lane`` maps to the
-    flattened logical element ``logical_n * N_LANES + out_k`` with the
-    row-dependent swizzle ``out_k = (lane + (logical_n & 255)) & 255``,
+    Storage lanes map to logical columns through the shared swizzle_lane helper,
     which spreads neighbouring values across lanes.
     """
     block = tl.program_id(0)
@@ -38,10 +37,6 @@ def _encode_kernel(
     has_data = block * BLOCK + lanes < n_elements
 
     logical_n_base = block * N_STEPS
-    # Hoisted swizzle: (block*N_STEPS + step) & 255 == (block_shift + step) & 255
-    # with block_shift loop-invariant, so the hot loop only sees `step`.
-    # (N_STEPS=256 -> block_shift=0; N_STEPS=128 -> 128*(block & 1).)
-    block_shift = (block * N_STEPS) & 255
     block_base = block * BLOCK
     # Fully-valid blocks can skip all per-element validity/mask checks.
     full_block = (block + 1) * BLOCK <= LOGICAL_NUMEL
@@ -49,10 +44,8 @@ def _encode_kernel(
         for step in tl.range(0, N_STEPS, 2, loop_unroll_factor=4):
             source_offset = block_base + step * N_LANES + lanes
             logical_n = logical_n_base + step
-            shift0 = (block_shift + step) & 255
-            shift1 = (block_shift + step + 1) & 255
-            input_k0 = (lanes + shift0) & 255
-            input_k1 = (lanes + shift1) & 255
+            input_k0 = swizzle_lane(logical_n_base, step, lanes)
+            input_k1 = swizzle_lane(logical_n_base, step + 1, lanes)
             input_offset0 = logical_n * N_LANES + input_k0
             input_offset1 = (logical_n + 1) * N_LANES + input_k1
             value0 = tl.load(source_bits + input_offset0).to(tl.int32)
@@ -101,10 +94,8 @@ def _encode_kernel(
             valid0 = source_offset < n_elements
             valid1 = source_offset + N_LANES < n_elements
             logical_n = logical_n_base + step
-            shift0 = (block_shift + step) & 255
-            shift1 = (block_shift + step + 1) & 255
-            input_k0 = (lanes + shift0) & 255
-            input_k1 = (lanes + shift1) & 255
+            input_k0 = swizzle_lane(logical_n_base, step, lanes)
+            input_k1 = swizzle_lane(logical_n_base, step + 1, lanes)
             input_offset0 = logical_n * N_LANES + input_k0
             input_offset1 = (logical_n + 1) * N_LANES + input_k1
             input_valid0 = input_offset0 < LOGICAL_NUMEL

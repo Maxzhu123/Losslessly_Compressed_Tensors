@@ -8,10 +8,36 @@ from ...codec.autotune import (
     POINTWISE_FALLBACK_AUTOTUNE_CONFIGS,
 )
 from ..primitives import decode_symbol, pack_bf16
+from .layout import swizzle_lane
 
 
 DENSE_OUTPUT = tl.constexpr(0)
 COMPRESSED_OUTPUT = tl.constexpr(1)
+
+
+@triton.jit
+def _load_scalars(alpha, beta, ALPHA_IS_ONE: tl.constexpr, BETA_IS_ONE: tl.constexpr):
+    """Load only the scalar values required by this specialization."""
+    alpha_value = 1.0
+    beta_value = 1.0
+    if not ALPHA_IS_ONE:
+        alpha_value = tl.load(alpha).to(tl.float32)
+    if not BETA_IS_ONE:
+        beta_value = tl.load(beta).to(tl.float32)
+    return alpha_value, beta_value
+
+
+@triton.jit
+def _apply_pointwise(
+    left, right, alpha, beta,
+    OP: tl.constexpr, SCALED: tl.constexpr,
+    ALPHA_IS_ONE: tl.constexpr, BETA_IS_ONE: tl.constexpr,
+):
+    """Apply the selected arithmetic with the same rounding in every kernel."""
+    if SCALED:
+        return OP(left, right, alpha, beta, ALPHA_IS_ONE, BETA_IS_ONE)
+    else:
+        return OP(left, right)
 
 
 @triton.jit
@@ -45,16 +71,11 @@ def _pointwise_location(
     LOGICAL_NUMEL: tl.constexpr,
     BLOCK: tl.constexpr, N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
 ):
-    """Map one storage-stream position to its flattened logical offset (1D).
-
-    The row swizzle ``(n & 255)`` is hoisted: ``(block*N_STEPS+step) & 255``
-    equals ``(block_shift + step) & 255`` with ``block_shift`` loop-invariant,
-    so callers in hot loops should prefer the hoisted form below.
-    """
+    """Map a storage-stream position to its logical offset and validity masks."""
     storage_offset = block * BLOCK + step * N_LANES + lane
     storage_valid = storage_offset < n_elements
     logical_n = block * N_STEPS + step
-    logical_k = (lane + (((block * N_STEPS) + step) & 255)) & 255
+    logical_k = swizzle_lane(block * N_STEPS, step, lane)
     logical_offset = logical_n * N_LANES + logical_k
     logical_valid = logical_offset < LOGICAL_NUMEL
     return storage_offset, logical_offset, storage_valid, logical_valid
@@ -62,18 +83,26 @@ def _pointwise_location(
 
 @triton.autotune(
     configs=DECODE_AUTOTUNE_CONFIGS,
-    key=["n_elements", "N_LANES", "N_STEPS", "FIXED_WORDS", "OUTPUT_POLICY"],
+    key=[
+        "n_elements", "N_LANES", "N_STEPS", "FIXED_WORDS", "OUTPUT_POLICY",
+        "OP", "SCALED", "ALPHA_IS_ONE", "BETA_IS_ONE",
+    ],
 )
 @triton.jit
 def pointwise_compressed_dense_kernel(
     encoded, sign_mantissa, other, output, auxiliary, decode_table,
-    n_elements, n_streams, center,
-    OP: tl.constexpr, OUTPUT_POLICY: tl.constexpr,
+    n_elements, n_streams, center, alpha, beta,
+    OP: tl.constexpr, SCALED: tl.constexpr,
+    ALPHA_IS_ONE: tl.constexpr, BETA_IS_ONE: tl.constexpr,
+    OUTPUT_POLICY: tl.constexpr,
     LOGICAL_NUMEL: tl.constexpr,
     FIRST_MASK: tl.constexpr, RARE_LENGTH: tl.constexpr,
     BLOCK: tl.constexpr, N_LANES: tl.constexpr,
     N_STEPS: tl.constexpr, FIXED_WORDS: tl.constexpr,
 ):
+    """ compA + B, compA * B, or alpha * compA + beta * B
+        Elementwise. Dense BF16 values or components for recompression.
+    """
     # One program handles one codec block; each lane decodes one fixed stream.
     block = tl.program_id(0)
     lanes = tl.arange(0, N_LANES)
@@ -87,24 +116,31 @@ def pointwise_compressed_dense_kernel(
     window |= word1.to(tl.uint32).to(tl.uint64) << 32
     center_value = tl.load(center).to(tl.int32)
 
+    # Unit scalars specialize away their loads and multiplications.
+    alpha_value, beta_value = _load_scalars(alpha, beta, ALPHA_IS_ONE, BETA_IS_ONE)
+
     # Fast path: fully-contained blocks skip all per-element validity checks.
-    # Hoisted swizzle: shift depends only on step + loop-invariant block_shift.
-    block_shift = (block * N_STEPS) & 255
     if (block + 1) * BLOCK <= LOGICAL_NUMEL:
         storage_offset = block * BLOCK + lanes
         true_mask = tl.full((N_LANES,), True, tl.int1)
-        for step in tl.range(0, N_STEPS, 2, loop_unroll_factor=2):
+        # Preserve the existing binary unrolling and scaled-operation scheduling.
+        UNROLL_FACTOR: tl.constexpr = 1 if SCALED else 2
+        for step in tl.range(
+            0, N_STEPS, 2, loop_unroll_factor=UNROLL_FACTOR,
+            flatten=SCALED, warp_specialize=SCALED,
+        ):
             logical_n0 = block * N_STEPS + step
             logical_n1 = logical_n0 + 1
-            logical_k0 = (lanes + ((block_shift + step) & 255)) & 255
-            logical_k1 = (lanes + ((block_shift + step + 1) & 255)) & 255
+            logical_k0 = swizzle_lane(block * N_STEPS, step, lanes)
+            logical_k1 = swizzle_lane(block * N_STEPS, step + 1, lanes)
             logical_offset0 = logical_n0 * N_LANES + logical_k0
             logical_offset1 = logical_n1 * N_LANES + logical_k1
-            # Prefetch the next 32-bit Huffman word while decoding the pair.
-            word2_prefetch = tl.load(
-                encoded + tl.minimum(word + 2, FIXED_WORDS - 1) * n_streams
-                + lane_index,
-            ).to(tl.uint32).to(tl.uint64)
+            # Binary operations prefetch; scaled operations load on word crossing.
+            if not SCALED:
+                word2_prefetch = tl.load(
+                    encoded + tl.minimum(word + 2, FIXED_WORDS - 1) * n_streams
+                    + lane_index,
+                ).to(tl.uint32).to(tl.uint64)
             # Decode symbol 0, reconstruct its BF16 value, then apply the op.
             current = window >> shift
             value, length = decode_symbol(
@@ -116,8 +152,11 @@ def pointwise_compressed_dense_kernel(
                 tl.bfloat16, bitcast=True
             )
             right = tl.load(other + logical_offset0, cache_modifier='.cg')
+            result = _apply_pointwise(
+                left, right, alpha_value, beta_value, OP, SCALED, ALPHA_IS_ONE, BETA_IS_ONE,
+            )
             _store_result(
-                OP(left, right), output, auxiliary, storage_offset,
+                result, output, auxiliary, storage_offset,
                 logical_offset0, true_mask, true_mask, OUTPUT_POLICY,
             )
 
@@ -133,8 +172,11 @@ def pointwise_compressed_dense_kernel(
                 tl.bfloat16, bitcast=True
             )
             right1 = tl.load(other + logical_offset1, cache_modifier='.cg')
+            result1 = _apply_pointwise(
+                left1, right1, alpha_value, beta_value, OP, SCALED, ALPHA_IS_ONE, BETA_IS_ONE,
+            )
             _store_result(
-                OP(left1, right1), output, auxiliary,
+                result1, output, auxiliary,
                 storage_offset + N_LANES, logical_offset1,
                 true_mask, true_mask, OUTPUT_POLICY,
             )
@@ -142,6 +184,12 @@ def pointwise_compressed_dense_kernel(
             # Advance the 64-bit window and storage offset after processing two symbols.
             next_shift = shift1 + length1
             crosses_word = next_shift >= 32
+            if SCALED:
+                word2_prefetch = tl.load(
+                    encoded + tl.minimum(word + 2, FIXED_WORDS - 1) * n_streams
+                    + lane_index,
+                    mask=crosses_word, other=0,
+                ).to(tl.uint32).to(tl.uint64)
             next_window = (window >> 32) | (word2_prefetch << 32)
             window = tl.where(crosses_word, next_window, window)
             word += crosses_word
@@ -163,8 +211,11 @@ def pointwise_compressed_dense_kernel(
                 tl.bfloat16, bitcast=True
             )
             right = tl.load(other + logical_offset, mask=valid, other=0.0, cache_modifier='.cg')
+            result = _apply_pointwise(
+                left, right, alpha_value, beta_value, OP, SCALED, ALPHA_IS_ONE, BETA_IS_ONE,
+            )
             _store_result(
-                OP(left, right), output, auxiliary, offset, logical_offset,
+                result, output, auxiliary, offset, logical_offset,
                 valid, storage_valid, OUTPUT_POLICY,
             )
 
@@ -182,8 +233,11 @@ def pointwise_compressed_dense_kernel(
                 tl.bfloat16, bitcast=True
             )
             right1 = tl.load(other + logical_offset1, mask=valid1, other=0.0, cache_modifier='.cg')
+            result1 = _apply_pointwise(
+                left1, right1, alpha_value, beta_value, OP, SCALED, ALPHA_IS_ONE, BETA_IS_ONE,
+            )
             _store_result(
-                OP(left1, right1), output, auxiliary, offset1, logical_offset1,
+                result1, output, auxiliary, offset1, logical_offset1,
                 valid1, storage_valid1, OUTPUT_POLICY,
             )
 
@@ -200,84 +254,21 @@ def pointwise_compressed_dense_kernel(
             shift = tl.where(crosses_word, next_shift - 32, next_shift)
 
 
-@triton.jit
-def _pointwise_fallback_impl(
-    bad_streams, bad_starts, fallback_offsets,
-    fallback_buffer, fallback_base, metadata, descriptor, count,
-    sign_mantissa, other, output, auxiliary, n_elements, tile_id,
-    alpha_value, beta_value,
-    OP: tl.constexpr, SCALED: tl.constexpr,
-    SCALE_OTHER: tl.constexpr, ALPHA_IS_ONE: tl.constexpr,
-    OUTPUT_POLICY: tl.constexpr, BUFFERED: tl.constexpr,
-    LOGICAL_NUMEL: tl.constexpr,
-    TILE: tl.constexpr, ROW_TILE: tl.constexpr, BLOCK: tl.constexpr,
-    N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
-):
-    """Process absolute overflow rows with coalesced side-byte and operand loads."""
-    tile = tile_id * TILE + tl.arange(0, TILE)
-    valid = tile < count
-    if BUFFERED:
-        base = tl.load(descriptor).to(tl.int32)
-        base_words = base // 4
-        stream = tl.load(metadata + base_words + tile, mask=valid, other=0)
-        start = tl.load(
-            bad_starts + base + 8 * count + tile,
-            mask=valid, other=N_STEPS,
-        )
-        fallback_offset = tl.load(
-            metadata + base_words + count + tile, mask=valid, other=0,
-        )
-        fallback_base = base + 9 * count
-    else:
-        stream = tl.load(bad_streams + tile, mask=valid, other=0)
-        start = tl.load(bad_starts + tile, mask=valid, other=N_STEPS)
-        fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0)
-    stream = stream.to(tl.int32)
-    start = start.to(tl.int32)
-    fallback_offset = fallback_offset.to(tl.int32)
-    block = stream // N_LANES
-    lane = stream % N_LANES
-    first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
-    row_offsets = tl.arange(0, ROW_TILE)
-    for first in tl.range(first_step, N_STEPS, ROW_TILE):
-        row = first + row_offsets
-        offset, logical_offset, storage_valid, logical_valid = _pointwise_location(
-            block[None, :], row[:, None], lane[None, :], n_elements,
-            LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS,
-        )
-        active = (
-            valid[None, :] & (row[:, None] >= start[None, :])
-            & (row[:, None] < N_STEPS) & storage_valid
-        )
-        logical_active = active & logical_valid
-        tail_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
-        exponent = tl.load(
-            fallback_buffer + fallback_base + tail_offset,
-            mask=active, other=0,
-        ).to(tl.int32)
-        sm = tl.load(sign_mantissa + offset, mask=active, other=0, cache_modifier='.cg')
-        left = pack_bf16(exponent, sm).to(tl.int16).to(tl.bfloat16, bitcast=True)
-        right = tl.load(other + logical_offset, mask=logical_active, other=0.0, cache_modifier='.cg')
-        if SCALED:
-            result = OP(left, right, alpha_value, beta_value, SCALE_OTHER, ALPHA_IS_ONE)
-        else:
-            result = OP(left, right)
-        _store_result(
-            result, output, auxiliary, offset, logical_offset,
-            logical_active, active, OUTPUT_POLICY,
-        )
-
-
 @triton.autotune(
     configs=POINTWISE_FALLBACK_AUTOTUNE_CONFIGS,
-    key=["n_elements", "N_LANES", "N_STEPS", "BLOCK", "OUTPUT_POLICY", "OP"],
+    key=[
+        "n_elements", "N_LANES", "N_STEPS", "BLOCK", "OUTPUT_POLICY",
+        "OP", "SCALED", "ALPHA_IS_ONE", "BETA_IS_ONE",
+    ],
 )
 @triton.jit
 def pointwise_compressed_dense_fallback_kernel(
     bad_streams, bad_starts, fallback_offsets,
     fallback_buffer, fallback_base, metadata, descriptor, fallback_count,
-    sign_mantissa, other, output, auxiliary, n_elements,
-    OP: tl.constexpr, OUTPUT_POLICY: tl.constexpr, BUFFERED: tl.constexpr,
+    sign_mantissa, other, output, auxiliary, n_elements, alpha, beta,
+    OP: tl.constexpr, SCALED: tl.constexpr,
+    ALPHA_IS_ONE: tl.constexpr, BETA_IS_ONE: tl.constexpr,
+    OUTPUT_POLICY: tl.constexpr, BUFFERED: tl.constexpr,
     LOGICAL_NUMEL: tl.constexpr,
     TILE: tl.constexpr, BLOCK: tl.constexpr,
     N_LANES: tl.constexpr, N_STEPS: tl.constexpr, ROW_TILE: tl.constexpr,
@@ -286,17 +277,66 @@ def pointwise_compressed_dense_fallback_kernel(
     count = tl.load(fallback_count).to(tl.int32)
     if tl.program_id(0) * TILE >= count:
         return
+    # Match the main kernel's scalar specialization after the empty-work check.
+    alpha_value, beta_value = _load_scalars(alpha, beta, ALPHA_IS_ONE, BETA_IS_ONE)
     for tile_id in tl.range(tl.program_id(0), tl.cdiv(count, TILE), tl.num_programs(0)):
-        _pointwise_fallback_impl(
-            bad_streams, bad_starts, fallback_offsets, fallback_buffer,
-            fallback_base, metadata, descriptor, count,
-            sign_mantissa, other, output, auxiliary, n_elements, tile_id,
-            1.0, 1.0,
-            OP=OP, SCALED=False, SCALE_OTHER=False, ALPHA_IS_ONE=False,
-            OUTPUT_POLICY=OUTPUT_POLICY, BUFFERED=BUFFERED,
-            LOGICAL_NUMEL=LOGICAL_NUMEL, TILE=TILE, ROW_TILE=ROW_TILE,
-            BLOCK=BLOCK, N_LANES=N_LANES, N_STEPS=N_STEPS,
-        )
+        # Load overflow stream metadata for this tile.
+        tile = tile_id * TILE + tl.arange(0, TILE)
+        valid = tile < count
+        if BUFFERED:
+            base = tl.load(descriptor).to(tl.int32)
+            base_words = base // 4
+            stream = tl.load(metadata + base_words + tile, mask=valid, other=0)
+            start = tl.load(
+                bad_starts + base + 8 * count + tile,
+                mask=valid, other=N_STEPS,
+            )
+            fallback_offset = tl.load(
+                metadata + base_words + count + tile, mask=valid, other=0,
+            )
+            tail_base = base + 9 * count
+        else:
+            stream = tl.load(bad_streams + tile, mask=valid, other=0)
+            start = tl.load(bad_starts + tile, mask=valid, other=N_STEPS)
+            fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0)
+            tail_base = fallback_base
+
+        # Process only rows at or beyond each stream's overflow start.
+        stream = stream.to(tl.int32)
+        start = start.to(tl.int32)
+        fallback_offset = fallback_offset.to(tl.int32)
+        block = stream // N_LANES
+        lane = stream % N_LANES
+        first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
+        row_offsets = tl.arange(0, ROW_TILE)
+        for first in tl.range(first_step, N_STEPS, ROW_TILE):
+            row = first + row_offsets
+            offset, logical_offset, storage_valid, logical_valid = _pointwise_location(
+                block[None, :], row[:, None], lane[None, :], n_elements,
+                LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS,
+            )
+            active = (
+                valid[None, :] & (row[:, None] >= start[None, :])
+                & (row[:, None] < N_STEPS) & storage_valid
+            )
+            logical_active = active & logical_valid
+
+            # Reconstruct BF16 operands and apply the same arithmetic as the main kernel.
+            tail_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
+            exponent = tl.load(
+                fallback_buffer + tail_base + tail_offset,
+                mask=active, other=0,
+            ).to(tl.int32)
+            sm = tl.load(sign_mantissa + offset, mask=active, other=0, cache_modifier='.cg')
+            left = pack_bf16(exponent, sm).to(tl.int16).to(tl.bfloat16, bitcast=True)
+            right = tl.load(other + logical_offset, mask=logical_active, other=0.0, cache_modifier='.cg')
+            result = _apply_pointwise(
+                left, right, alpha_value, beta_value, OP, SCALED, ALPHA_IS_ONE, BETA_IS_ONE,
+            )
+            _store_result(
+                result, output, auxiliary, offset, logical_offset,
+                logical_active, active, OUTPUT_POLICY,
+            )
 
 
 @triton.jit
@@ -309,3 +349,17 @@ def add_op(left, right):
 def multiply_op(left, right):
     """Multiply operands inside a specialized pointwise kernel."""
     return left * right
+
+
+@triton.jit
+def _scaled_sum(left, right, alpha, beta, ALPHA_IS_ONE: tl.constexpr, BETA_IS_ONE: tl.constexpr):
+    """ alpha * compA + beta * B
+        Elementwise. Preserve FP32 scaling and fused multiply-add ordering.
+    """
+    if ALPHA_IS_ONE:
+        if not BETA_IS_ONE:
+            return tl.math.fma(right.to(tl.float32), beta, left.to(tl.float32))
+        return left.to(tl.float32) + right.to(tl.float32)
+    if not BETA_IS_ONE:
+        right = right.to(tl.float32) * beta
+    return tl.math.fma(left, alpha, right)

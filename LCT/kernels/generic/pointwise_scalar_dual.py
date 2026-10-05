@@ -9,7 +9,9 @@ import triton
 from triton import language as tl
 
 from ...codec.autotune import DUAL_DECODE_AUTOTUNE_CONFIGS
+from ..common.tables import _shift_decoding_table_impl
 from ..primitives import decode_symbol, pack_bf16
+from .layout import swizzle_lane
 from .pointwise import _pointwise_location, _store_result
 
 
@@ -47,7 +49,6 @@ def _prepare_dual_tables_and_maps_kernel(
 ):
     """Shift both decode tables and build both fallback maps in one launch."""
     pid = tl.program_id(0)
-    idx = tl.arange(0, BLOCK)
 
     if pid < N_SHIFT:
         if pid == 0:
@@ -59,16 +60,7 @@ def _prepare_dual_tables_and_maps_kernel(
             center = b_center
             shifted_decode = b_shifted_decode
         center_value = tl.load(center).to(tl.int32)
-        zero_delta = (-127 - center_value) & 255
-        packed = tl.load(base_decode + idx).to(tl.int32)
-        length = packed & 255
-        symbol = (packed >> 8) & 255
-        is_zero = symbol == 0
-        delta = tl.where(symbol == 0, 0, symbol - (symbol <= zero_delta).to(tl.int32))
-        delta = tl.where(delta >= 128, delta - 256, delta)
-        exponent = tl.where(is_zero, -127, delta + center_value)
-        shifted = tl.where(length == 0, 0, length | (exponent << 8))
-        tl.store(shifted_decode + idx, shifted)
+        _shift_decoding_table_impl(base_decode, center_value, shifted_decode, BLOCK)
         return
 
     a_count = tl.load(a_fallback_count).to(tl.int32)
@@ -226,8 +218,6 @@ def pointwise_scalar_mul_add_compressed_compressed_mapped_kernel(
     alpha_value = tl.load(alpha).to(tl.float32)
 
     # Fast path: fully-contained blocks skip all per-element validity checks.
-    # Hoisted swizzle: shift depends only on step + loop-invariant block_shift.
-    block_shift = (block * N_STEPS) & 255
     if (block + 1) * BLOCK <= LOGICAL_NUMEL:
         for step in tl.range(0, N_STEPS, 2, loop_unroll_factor=6):
             a_word2_prefetch = tl.load(
@@ -264,9 +254,8 @@ def pointwise_scalar_mul_add_compressed_compressed_mapped_kernel(
 
             offset0 = block * BLOCK + step * N_LANES + lanes
             logical_n0 = block * N_STEPS + step
-            # Row-dependent swizzle matches the encode/decode layout and
-            # prevents correlations across rows of the flattened input.
-            logical_k0 = (lanes + ((block_shift + step) & 255)) & 255
+            # Use the same storage-to-logical mapping as the codec.
+            logical_k0 = swizzle_lane(block * N_STEPS, step, lanes)
             logical_offset0 = logical_n0 * N_LANES + logical_k0
             sm_a0 = tl.load(a_sign_mantissa + offset0, cache_modifier='.cg')
             sm_b0 = tl.load(b_sign_mantissa + offset0, cache_modifier='.cg')
@@ -305,7 +294,7 @@ def pointwise_scalar_mul_add_compressed_compressed_mapped_kernel(
 
             offset1 = offset0 + N_LANES
             logical_n1 = logical_n0 + 1
-            logical_k1 = (lanes + ((block_shift + step + 1) & 255)) & 255
+            logical_k1 = swizzle_lane(block * N_STEPS, step + 1, lanes)
             logical_offset1 = logical_n1 * N_LANES + logical_k1
             sm_a1 = tl.load(a_sign_mantissa + offset1, cache_modifier='.cg')
             sm_b1 = tl.load(b_sign_mantissa + offset1, cache_modifier='.cg')

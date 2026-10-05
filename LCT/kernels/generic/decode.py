@@ -4,6 +4,8 @@ import triton
 from triton import language as tl
 
 from ...codec.autotune import DECODE_AUTOTUNE_CONFIGS
+from ..primitives import decode_symbol, pack_bf16
+from .layout import swizzle_lane
 
 
 @triton.autotune(
@@ -35,19 +37,16 @@ def _decode_kernel(
     ).to(tl.uint32).to(tl.uint64)
     window = word0 | (word1 << 32)
     center_value = tl.load(center).to(tl.int32)
-    zero_delta = (-127 - center_value) & 255
     # Fast path: fully-contained blocks skip all per-element validity checks.
     # The swizzled logical mapping (storage -> flattened output) still applies.
-    # Hoisted swizzle: shift depends only on step + loop-invariant block_shift.
-    block_shift = (block * N_STEPS) & 255
     block_base = block * BLOCK
     if (block + 1) * BLOCK <= LOGICAL_NUMEL:
         storage_offset = block_base + lanes
         for step in tl.range(0, N_STEPS, 2, flatten=True, warp_specialize=True):
             logical_n0 = block * N_STEPS + step
             logical_n1 = logical_n0 + 1
-            out_k0 = (lanes + ((block_shift + step) & 255)) & 255
-            out_k1 = (lanes + ((block_shift + step + 1) & 255)) & 255
+            out_k0 = swizzle_lane(block * N_STEPS, step, lanes)
+            out_k1 = swizzle_lane(block * N_STEPS, step + 1, lanes)
             output_offset0 = logical_n0 * N_LANES + out_k0
             output_offset1 = logical_n1 * N_LANES + out_k1
             if not ON_DEMAND:
@@ -56,48 +55,20 @@ def _decode_kernel(
                 ).to(tl.uint32).to(tl.uint64)
             # Decode symbol 0 from the current prefix bits.
             current = window >> shift
-            first = tl.load(
-                decode_table + (current & FIRST_MASK).to(tl.int32),
-                cache_modifier='.ca',
+            value, length = decode_symbol(
+                current, decode_table, center_value, FIRST_MASK, RARE_LENGTH,
             )
-            first_length = first & 255
-            continuation = first_length == 0
-            length = tl.where(continuation, RARE_LENGTH + 8, first_length)
-            symbol = ((current >> RARE_LENGTH) & 255).to(tl.int32)
-            is_zero = symbol == 0
-            delta = tl.where(symbol == 0, 0, symbol - (symbol <= zero_delta).to(tl.int32))
-            delta = tl.where(delta >= 128, delta - 256, delta)
-            escaped_value = tl.where(is_zero, -127, delta + center_value)
-            value = tl.where(continuation, escaped_value, first >> 8)
             sm = tl.load(sign_mantissa + storage_offset, cache_modifier='.cg')
-            packed = (
-                (((value.to(tl.int32) + 127) & 255) << 7)
-                | (sm.to(tl.int32) & 0x7F)
-                | ((sm.to(tl.int32) & 0x80) << 8)
-            )
+            packed = pack_bf16(value, sm)
             tl.store(output + output_offset0, packed.to(tl.int16), cache_modifier='.cs')
             # Decode symbol 1 at the bit offset after symbol 0.
             shift1 = shift + length
             current1 = window >> shift1
-            first1 = tl.load(
-                decode_table + (current1 & FIRST_MASK).to(tl.int32),
-                cache_modifier='.ca',
+            value1, length1 = decode_symbol(
+                current1, decode_table, center_value, FIRST_MASK, RARE_LENGTH,
             )
-            first_length1 = first1 & 255
-            continuation1 = first_length1 == 0
-            length1 = tl.where(continuation1, RARE_LENGTH + 8, first_length1)
-            symbol1 = ((current1 >> RARE_LENGTH) & 255).to(tl.int32)
-            is_zero1 = symbol1 == 0
-            delta1 = tl.where(symbol1 == 0, 0, symbol1 - (symbol1 <= zero_delta).to(tl.int32))
-            delta1 = tl.where(delta1 >= 128, delta1 - 256, delta1)
-            escaped_value1 = tl.where(is_zero1, -127, delta1 + center_value)
-            value1 = tl.where(continuation1, escaped_value1, first1 >> 8)
             sm1 = tl.load(sign_mantissa + storage_offset + N_LANES, cache_modifier='.cg')
-            packed1 = (
-                (((value1.to(tl.int32) + 127) & 255) << 7)
-                | (sm1.to(tl.int32) & 0x7F)
-                | ((sm1.to(tl.int32) & 0x80) << 8)
-            )
+            packed1 = pack_bf16(value1, sm1)
             tl.store(
                 output + output_offset1,
                 packed1.to(tl.int16),
@@ -129,52 +100,28 @@ def _decode_kernel(
             ).to(tl.uint32).to(tl.uint64)
             logical_n0 = logical_n + step
             logical_n1 = logical_n0 + 1
-            out_k0 = (lanes + ((block_shift + step) & 255)) & 255
-            out_k1 = (lanes + ((block_shift + step + 1) & 255)) & 255
+            out_k0 = swizzle_lane(block * N_STEPS, step, lanes)
+            out_k1 = swizzle_lane(block * N_STEPS, step + 1, lanes)
             output_offset0 = logical_n0 * N_LANES + out_k0
             output_offset1 = logical_n1 * N_LANES + out_k1
             storage_valid = storage_offset < n_elements
             valid = output_offset0 < LOGICAL_NUMEL
             # Decode symbol 0 from the current prefix bits.
             current = window >> shift
-            first = tl.load(
-                decode_table + (current & FIRST_MASK).to(tl.int32),
-                cache_modifier='.ca',
+            value, length = decode_symbol(
+                current, decode_table, center_value, FIRST_MASK, RARE_LENGTH,
             )
-            first_length = first & 255
-            continuation = first_length == 0
-            length = tl.where(continuation, RARE_LENGTH + 8, first_length)
-            symbol = ((current >> RARE_LENGTH) & 255).to(tl.int32)
-            is_zero = symbol == 0
-            delta = tl.where(symbol == 0, 0, symbol - (symbol <= zero_delta).to(tl.int32))
-            delta = tl.where(delta >= 128, delta - 256, delta)
-            escaped_value = tl.where(is_zero, -127, delta + center_value)
-            value = tl.where(continuation, escaped_value, first >> 8)
             sm = tl.load(
                 sign_mantissa + storage_offset,
                 mask=storage_valid, other=0, cache_modifier='.cg',
             )
-            packed = (
-                (((value.to(tl.int32) + 127) & 255) << 7)
-                | (sm.to(tl.int32) & 0x7F)
-                | ((sm.to(tl.int32) & 0x80) << 8)
-            )
+            packed = pack_bf16(value, sm)
             tl.store(output + output_offset0, packed.to(tl.int16), mask=valid, cache_modifier='.cs')
             shift1 = shift + tl.where(storage_valid, length, 0)
             current1 = window >> shift1
-            first1 = tl.load(
-                decode_table + (current1 & FIRST_MASK).to(tl.int32),
-                cache_modifier='.ca',
+            value1, length1 = decode_symbol(
+                current1, decode_table, center_value, FIRST_MASK, RARE_LENGTH,
             )
-            first_length1 = first1 & 255
-            continuation1 = first_length1 == 0
-            length1 = tl.where(continuation1, RARE_LENGTH + 8, first_length1)
-            symbol1 = ((current1 >> RARE_LENGTH) & 255).to(tl.int32)
-            is_zero1 = symbol1 == 0
-            delta1 = tl.where(symbol1 == 0, 0, symbol1 - (symbol1 <= zero_delta).to(tl.int32))
-            delta1 = tl.where(delta1 >= 128, delta1 - 256, delta1)
-            escaped_value1 = tl.where(is_zero1, -127, delta1 + center_value)
-            value1 = tl.where(continuation1, escaped_value1, first1 >> 8)
             storage_offset1 = storage_offset + N_LANES
             storage_valid1 = storage_offset1 < n_elements
             valid1 = output_offset1 < LOGICAL_NUMEL
@@ -182,11 +129,7 @@ def _decode_kernel(
                 sign_mantissa + storage_offset1,
                 mask=storage_valid1, other=0, cache_modifier='.cg',
             )
-            packed1 = (
-                (((value1.to(tl.int32) + 127) & 255) << 7)
-                | (sm1.to(tl.int32) & 0x7F)
-                | ((sm1.to(tl.int32) & 0x80) << 8)
-            )
+            packed1 = pack_bf16(value1, sm1)
             tl.store(
                 output + output_offset1,
                 packed1.to(tl.int16), mask=valid1, cache_modifier='.cs',

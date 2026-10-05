@@ -4,15 +4,6 @@ import triton
 from triton import language as tl
 
 
-# Status codes written to a descriptor's slot 2 by allocate/free.
-_STATUS_OK = 0
-_STATUS_OUT_OF_MEMORY = 1
-_STATUS_INVALID_REQUEST = 2
-_STATUS_FREE_LIST_FULL = 3
-_STATUS_INVALID_FREE = 4
-_STATUS_FREED = 5
-
-
 @triton.jit
 def _lock(lock):
     while tl.atomic_cas(lock, 0, 1) != 0:
@@ -199,4 +190,3 @@ def _free_storage_kernel(
         metadata + 2 * MAX_FREE_REGIONS, metadata + 2 * MAX_FREE_REGIONS + 1,
         metadata + 2 * MAX_FREE_REGIONS + 2, status, MAX_FREE_REGIONS,
     )
-
