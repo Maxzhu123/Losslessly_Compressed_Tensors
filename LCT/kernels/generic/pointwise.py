@@ -1,10 +1,10 @@
-"""Generic Triton templates for pointwise compressed-tensor operations."""
-
+"""Generic Triton templates for pointwise compressed-tensor operations.
+"""
 import triton
 from triton import language as tl
 
-from ...codec.autotune import (
-    DECODE_AUTOTUNE_CONFIGS,
+from ..autotune import (
+    POINTWISE_DENSE_AUTOTUNE_CONFIGS,
     POINTWISE_FALLBACK_AUTOTUNE_CONFIGS,
 )
 from ..primitives import decode_symbol, pack_bf16
@@ -82,7 +82,7 @@ def _pointwise_location(
 
 
 @triton.autotune(
-    configs=DECODE_AUTOTUNE_CONFIGS,
+    configs=POINTWISE_DENSE_AUTOTUNE_CONFIGS,
     key=[
         "n_elements", "N_LANES", "N_STEPS", "FIXED_WORDS", "OUTPUT_POLICY",
         "OP", "SCALED", "ALPHA_IS_ONE", "BETA_IS_ONE",
@@ -263,80 +263,78 @@ def pointwise_compressed_dense_kernel(
 )
 @triton.jit
 def pointwise_compressed_dense_fallback_kernel(
-    bad_streams, bad_starts, fallback_offsets,
-    fallback_buffer, fallback_base, metadata, descriptor, fallback_count,
+    lanes, starts, tail, descriptor, fallback_count, blocks, fallback_base,
     sign_mantissa, other, output, auxiliary, n_elements, alpha, beta,
     OP: tl.constexpr, SCALED: tl.constexpr,
     ALPHA_IS_ONE: tl.constexpr, BETA_IS_ONE: tl.constexpr,
     OUTPUT_POLICY: tl.constexpr, BUFFERED: tl.constexpr,
     LOGICAL_NUMEL: tl.constexpr,
-    TILE: tl.constexpr, BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
     N_LANES: tl.constexpr, N_STEPS: tl.constexpr, ROW_TILE: tl.constexpr,
 ):
-    """Recompute overflow results using a bounded grid of persistent programs."""
-    count = tl.load(fallback_count).to(tl.int32)
-    if tl.program_id(0) * TILE >= count:
-        return
+    """Recompute one storage block of overflow results."""
+    block_id = tl.program_id(0)
+    n_blocks = tl.num_programs(0)
+    if BUFFERED:
+        total = tl.load(fallback_count).to(tl.int32)
+        base = tl.load(descriptor).to(tl.int32)
+        lane_off = base
+        start_off = base + total
+        tail_base = base + 2 * total
+        tail_ptr = tail
+    else:
+        lane_off = 0
+        start_off = 0
+        tail_base = fallback_base
+        tail_ptr = tail
     # Match the main kernel's scalar specialization after the empty-work check.
     alpha_value, beta_value = _load_scalars(alpha, beta, ALPHA_IS_ONE, BETA_IS_ONE)
-    for tile_id in tl.range(tl.program_id(0), tl.cdiv(count, TILE), tl.num_programs(0)):
-        # Load overflow stream metadata for this tile.
-        tile = tile_id * TILE + tl.arange(0, TILE)
-        valid = tile < count
-        if BUFFERED:
-            base = tl.load(descriptor).to(tl.int32)
-            base_words = base // 4
-            stream = tl.load(metadata + base_words + tile, mask=valid, other=0)
-            start = tl.load(
-                bad_starts + base + 8 * count + tile,
-                mask=valid, other=N_STEPS,
-            )
-            fallback_offset = tl.load(
-                metadata + base_words + count + tile, mask=valid, other=0,
-            )
-            tail_base = base + 9 * count
-        else:
-            stream = tl.load(bad_streams + tile, mask=valid, other=0)
-            start = tl.load(bad_starts + tile, mask=valid, other=N_STEPS)
-            fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0)
-            tail_base = fallback_base
+    count = tl.load(blocks + block_id).to(tl.int32)
+    if count == 0:
+        return
+    first = tl.load(blocks + n_blocks + block_id).to(tl.int32)
+    byte_base = tl.load(blocks + 2 * n_blocks + block_id).to(tl.int32)
 
-        # Process only rows at or beyond each stream's overflow start.
-        stream = stream.to(tl.int32)
-        start = start.to(tl.int32)
-        fallback_offset = fallback_offset.to(tl.int32)
-        block = stream // N_LANES
-        lane = stream % N_LANES
-        first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
-        row_offsets = tl.arange(0, ROW_TILE)
-        for first in tl.range(first_step, N_STEPS, ROW_TILE):
-            row = first + row_offsets
-            offset, logical_offset, storage_valid, logical_valid = _pointwise_location(
-                block[None, :], row[:, None], lane[None, :], n_elements,
-                LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS,
-            )
-            active = (
-                valid[None, :] & (row[:, None] >= start[None, :])
-                & (row[:, None] < N_STEPS) & storage_valid
-            )
-            logical_active = active & logical_valid
+    k = tl.arange(0, N_LANES)
+    valid = k < count
+    lane = tl.load(lanes + lane_off + first + k, mask=valid, other=0).to(tl.int32)
+    start = tl.load(
+        starts + start_off + first + k, mask=valid, other=N_STEPS,
+    ).to(tl.int32)
+    length = tl.where(valid, N_STEPS - start, 0)
+    local = tl.cumsum(length, axis=0) - length
+    fallback_offset = byte_base + local
 
-            # Reconstruct BF16 operands and apply the same arithmetic as the main kernel.
-            tail_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
-            exponent = tl.load(
-                fallback_buffer + tail_base + tail_offset,
-                mask=active, other=0,
-            ).to(tl.int32)
-            sm = tl.load(sign_mantissa + offset, mask=active, other=0, cache_modifier='.cg')
-            left = pack_bf16(exponent, sm).to(tl.int16).to(tl.bfloat16, bitcast=True)
-            right = tl.load(other + logical_offset, mask=logical_active, other=0.0, cache_modifier='.cg')
-            result = _apply_pointwise(
-                left, right, alpha_value, beta_value, OP, SCALED, ALPHA_IS_ONE, BETA_IS_ONE,
-            )
-            _store_result(
-                result, output, auxiliary, offset, logical_offset,
-                logical_active, active, OUTPUT_POLICY,
-            )
+    # Process only rows at or beyond each stream's overflow start.
+    first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
+    row_offsets = tl.arange(0, ROW_TILE)
+    for row_first in tl.range(first_step, N_STEPS, ROW_TILE):
+        row = row_first + row_offsets
+        offset, logical_offset, storage_valid, logical_valid = _pointwise_location(
+            block_id, row[:, None], lane[None, :], n_elements,
+            LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS,
+        )
+        active = (
+            valid[None, :] & (row[:, None] >= start[None, :])
+            & (row[:, None] < N_STEPS) & storage_valid
+        )
+        logical_active = active & logical_valid
+
+        # Reconstruct BF16 operands and apply the same arithmetic as the main kernel.
+        tail_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
+        exponent = tl.load(
+            tail_ptr + tail_base + tail_offset, mask=active, other=0,
+        ).to(tl.int32)
+        sm = tl.load(sign_mantissa + offset, mask=active, other=0, cache_modifier='.cg')
+        left = pack_bf16(exponent, sm).to(tl.int16).to(tl.bfloat16, bitcast=True)
+        right = tl.load(other + logical_offset, mask=logical_active, other=0.0, cache_modifier='.cg')
+        result = _apply_pointwise(
+            left, right, alpha_value, beta_value, OP, SCALED, ALPHA_IS_ONE, BETA_IS_ONE,
+        )
+        _store_result(
+            result, output, auxiliary, offset, logical_offset,
+            logical_active, active, OUTPUT_POLICY,
+        )
 
 
 @triton.jit

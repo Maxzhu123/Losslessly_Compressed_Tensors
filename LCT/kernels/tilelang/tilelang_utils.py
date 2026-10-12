@@ -1,13 +1,14 @@
 """Shared TileLang logging and representative-input tuning utilities."""
 
 import logging
-import os
 from typing import Any
 
 import torch
-import tilelang
 from tilelang.autotuner import set_autotune_inputs
 from tilelang.autotuner.tuner import _normalize_value
+from tilelang.env import env
+
+from ... import config
 
 
 class _QuietTqdm:
@@ -40,17 +41,13 @@ class _QuietTqdm:
         pass
 
 
-def silence_autotune() -> None:
-    """Suppress tuner progress and INFO/WARNING logs unless verbose is enabled.
-
-    Set ``LCT_TILELANG_VERBOSE=1`` to keep the normal autotuning output.
-    Compilation logging and error reporting retain their existing behavior.
-    """
-    if os.environ.get("LCT_TILELANG_VERBOSE", "").lower() in ("1", "true", "yes", "on"):
+def configure_autotune() -> None:
+    """Apply LCT's cache and logging settings before creating kernel tuners."""
+    # TileLang's runtime override leaves the process environment untouched.
+    env.TILELANG_AUTO_TUNING_DISABLE_CACHE = "1" if config.reset_cache else "0"
+    if config.tilelang_verbose:
         return
 
-    os.environ.setdefault("TQDM_DISABLE", "1")
-    # tilelang.set_log_level(logging.ERROR)
     logging.getLogger("tilelang.autotuner.tuner").setLevel(logging.ERROR)
     from tilelang.autotuner import tuner as _tuner
 

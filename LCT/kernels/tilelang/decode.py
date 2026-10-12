@@ -1,17 +1,18 @@
-"""TileLang Huffman decoding with native autotuning."""
-
+"""TileLang Huffman decoding with native autotuning.
+"""
 import torch
 import tilelang
 import tilelang.language as T
 
+from ..generic.layout import swizzle_col
 from .autotune import DECODE_AUTOTUNE_CONFIGS
-from .tilelang_utils import silence_autotune
+from .tilelang_utils import configure_autotune
 
 
 _PASS_CONFIGS = {"tl.disable_safe_memory_legalize": True, "tl.disable_warp_specialized": True}
 
 
-silence_autotune()
+configure_autotune()
 
 
 # Integer intrinsics preserve every BF16 representation, including NaN payloads.
@@ -112,7 +113,7 @@ def decode_kernel(encoded: torch.Tensor, side: torch.Tensor, base_table: torch.T
                                     sm[owned] = T.Cast("int32", T.call_extern("uint8", "__ldcg", T.address_of(side[storage])))
                                 else:
                                     sm[owned] = T.if_then_else(storage < storage_numel, T.Cast("int32", side[storage]), 0)
-                                col = (lane + block * steps + step) & 255
+                                col = swizzle_col(lane, block * steps + step)
                                 decoded[pair * 2 + member, col] = T.Cast("int16", (raw_exponent << 7) | (sm[owned] & 127) | ((sm[owned] & 128) << 8))
                                 shift[owned] = shift[owned] + consumed
                         for owned in T.unroll(streams_per_thread):
@@ -126,8 +127,8 @@ def decode_kernel(encoded: torch.Tensor, side: torch.Tensor, base_table: torch.T
                                 # its replacement is needed at the next crossing.
                                 next_word[owned] = encoded[T.min(word[owned] + 2, fixed_words - 1) * streams + stream]
                     T.sync_threads()
-                    # Eight-byte aligned stores remove the global row swizzle.
-                    # The rotated writes above place results in logical order.
+                    # Staged above through the shared swizzle, so this is a
+                    # straight aligned store of the decoded logical row.
                     for work in T.serial(row_tile * lanes // (4 * threads)):
                         flat = work * threads + thread
                         row = flat // 64

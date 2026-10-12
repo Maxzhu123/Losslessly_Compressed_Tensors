@@ -1,7 +1,9 @@
-"""Center estimation and shifted Huffman tables shared across backends."""
-
+"""Center estimation and shifted Huffman tables shared across backends.
+"""
 import triton
 from triton import language as tl
+
+from ...compression.huffman_tables import FIRST_BITS
 
 
 @triton.jit
@@ -65,18 +67,26 @@ def _shift_encoding_table_impl(
     tl.store(shifted_encode + raw_byte, packed)
 
 
+# The decode table is indexed by a FIRST_BITS prefix, not by an
+# exponent byte, so it is 1 << FIRST_BITS wide (the encode table is 256).
+_DECODE_BLOCK = tl.constexpr(1 << FIRST_BITS)
+
+
 @triton.jit
 def _shift_encoding_table_kernel(
-    base_encode, center, shifted_encode, BLOCK: tl.constexpr,
+    base_encode, center, shifted_encode, base_decode, shifted_decode,
+    BLOCK: tl.constexpr,
 ):
     """Create a raw-exponent-byte-indexed encode table for one center."""
     center_value = tl.load(center).to(tl.int32)
     _shift_encoding_table_impl(base_encode, center_value, shifted_encode, BLOCK)
+    _shift_decoding_table_impl(base_decode, center_value, shifted_decode, _DECODE_BLOCK)
 
 
 @triton.jit
 def _estimate_and_shift_encoding_table_kernel(
     source_bits, center_out, size, base_encode, shifted_encode,
+    base_decode, shifted_decode,
     SAMPLE_SIZE: tl.constexpr, PRECOMPUTED: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -86,6 +96,7 @@ def _estimate_and_shift_encoding_table_kernel(
     )
     tl.store(center_out, center)
     _shift_encoding_table_impl(base_encode, center, shifted_encode, BLOCK=256)
+    _shift_decoding_table_impl(base_decode, center, shifted_decode, _DECODE_BLOCK)
 
 
 @triton.jit

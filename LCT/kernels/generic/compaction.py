@@ -1,10 +1,26 @@
-"""Generic overflow counting, compaction, and decode scatter kernels."""
+"""Generic overflow counting, compaction, and decode scatter kernels.
 
+The compact fallback list is stored **per storage block**:
+
+* ``lanes``   uint8[count]   storage lane of each overflowing stream
+* ``starts``  uint8[count]   first step held in fallback storage for that stream
+* ``blocks``  int32[3*n_blocks]
+    - ``blocks[b]``              number of overflowing streams in block ``b``
+    - ``blocks[n_blocks + b]``   index of the block's first entry in the list
+    - ``blocks[2*n_blocks + b]`` byte offset of the block's first tail
+
+Entries and tail bytes of one block are contiguous and are positioned by that
+block alone, so the list order never has to agree with the tail order. That is
+what lets every consumer walk the list a block at a time and recover each
+entry's dense tail offset from the block base plus a local prefix sum, with no
+offset array and no separate offset pass.
+"""
 import triton
 from triton import language as tl
 
-from ...codec.autotune import (
+from ..autotune import (
     COMPACT_BAD_STREAMS_AUTOTUNE_CONFIGS,
+    COMPACT_BLOCK_AUTOTUNE_CONFIGS,
     COMPACT_EXTRA_AUTOTUNE_CONFIGS,
     DENSE_SCATTER_AUTOTUNE_CONFIGS,
 )
@@ -36,111 +52,73 @@ def _count_bad_streams_kernel(
 
 
 @triton.autotune(
-    configs=COMPACT_BAD_STREAMS_AUTOTUNE_CONFIGS,
+    configs=COMPACT_BLOCK_AUTOTUNE_CONFIGS,
     key=["n_streams", "steps"],
     restore_value=["bad_count", "fallback_total"],
 )
 @triton.jit
 def _compact_bad_streams_kernel(
     extra_starts,
-    bad_streams_out, bad_starts_out, fallback_offsets_out,
-    metadata_buffer, allocation_descriptor, final_counts,
-    bad_count, fallback_total, n_streams, steps,
-    BUFFERED: tl.constexpr, BLOCK: tl.constexpr,
+    lanes, starts, descriptor, blocks, final_counts,
+    bad_count, fallback_total, n_streams, steps, n_blocks,
+    BUFFERED: tl.constexpr, N_LANES: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_streams
-    start = tl.load(extra_starts + offs, mask=mask, other=255)
+    """One program per storage block; reserves its own slots and tail bytes.
+
+    The entry slots and the tail bytes are reserved with two independent
+    atomics. That is safe here precisely because each block records its own
+    ``first`` and ``byte_base``: nothing has to match a global list order.
+    """
+    block = tl.program_id(0)
+    lane = tl.arange(0, N_LANES)
+    stream = block * N_LANES + lane
+    mask = stream < n_streams
+    start = tl.load(extra_starts + stream, mask=mask, other=255).to(tl.int32)
     bad = mask & (start != 255)
     lengths = tl.where(bad, steps - start, 0)
     cnt = tl.sum(bad.to(tl.int32), axis=0)
     total_len = tl.sum(lengths, axis=0)
     block_start = tl.atomic_add(bad_count, cnt, mask=cnt != 0)
-    fallback_block_start = tl.atomic_add(
-        fallback_total, total_len, mask=total_len != 0
-    )
-    prefix = tl.cumsum(bad.to(tl.int32), axis=0) - bad.to(tl.int32)
-    offset_prefix = tl.cumsum(lengths, axis=0) - lengths
-    dense_offset = fallback_block_start + offset_prefix
-    pos = block_start + prefix
-    if BUFFERED:
-        count = tl.load(final_counts).to(tl.int32)
-        base = tl.load(allocation_descriptor).to(tl.int32)
-        base_words = base // 4
-        tl.store(metadata_buffer + base_words + pos, offs.to(tl.int32), mask=bad)
-        tl.store(
-            metadata_buffer + base_words + count + pos,
-            dense_offset,
-            mask=bad,
-        )
-        tl.store(bad_starts_out + base + 8 * count + pos, start, mask=bad)
-    else:
-        tl.store(bad_streams_out + pos, offs.to(tl.int32), mask=bad)
-        tl.store(bad_starts_out + pos, start, mask=bad)
-        tl.store(
-            fallback_offsets_out + pos,
-            dense_offset,
-            mask=bad,
-        )
+    byte_start = tl.atomic_add(fallback_total, total_len, mask=total_len != 0)
+    tl.store(blocks + block, cnt)
+    tl.store(blocks + n_blocks + block, block_start)
+    tl.store(blocks + 2 * n_blocks + block, byte_start)
+    if cnt > 0:
+        rank = tl.cumsum(bad.to(tl.int32), axis=0) - bad.to(tl.int32)
+        pos = block_start + rank
+        if BUFFERED:
+            total = tl.load(final_counts).to(tl.int32)
+            base = tl.load(descriptor).to(tl.int32)
+            tl.store(lanes + base + pos, lane.to(tl.uint8), mask=bad)
+            tl.store(starts + base + total + pos, start.to(tl.uint8), mask=bad)
+        else:
+            tl.store(lanes + pos, lane.to(tl.uint8), mask=bad)
+            tl.store(starts + pos, start.to(tl.uint8), mask=bad)
 
 
 @triton.jit
-def _compact_extra_impl(
-    source_bits,
-    extra_streams, extra_starts,
-    fallback_offsets, fallback_data,
-    metadata_buffer, allocation_descriptor, final_counts, bad_count,
-    n_elements,
-    BUFFERED: tl.constexpr, PRECOMPUTED: tl.constexpr,
-    LOGICAL_NUMEL: tl.constexpr,
-    BLOCK: tl.constexpr, N_LANES: tl.constexpr, N_STEPS: tl.constexpr, TILE: tl.constexpr,
-    ROW_TILE: tl.constexpr, tile_id,
+def _compact_extra_rows(
+    source_bits, tail, tail_off, n_elements, block_id,
+    lane, start, valid, fallback_offset,
+    PRECOMPUTED: tl.constexpr, LOGICAL_NUMEL: tl.constexpr,
+    BLOCK: tl.constexpr, N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
+    ROW_TILE: tl.constexpr,
 ):
-    pid = tile_id
-    tile = pid * TILE + tl.arange(0, TILE)
-    if BUFFERED:
-        count = tl.load(final_counts).to(tl.int32)
-    else:
-        count = tl.load(bad_count).to(tl.int32)
-    if pid * TILE >= count:
-        return
-    valid = tile < count
-    if BUFFERED:
-        base = tl.load(allocation_descriptor).to(tl.int32)
-        base_words = base // 4
-        stream = tl.load(metadata_buffer + base_words + tile, mask=valid, other=0).to(tl.int32)
-        start = tl.load(
-            extra_starts + base + 8 * count + tile,
-            mask=valid,
-            other=N_STEPS,
-        ).to(tl.int32)
-        fallback_offset = tl.load(
-            metadata_buffer + base_words + count + tile,
-            mask=valid,
-            other=0,
-        ).to(tl.int32)
-        fallback_base = base + 9 * count
-    else:
-        stream = tl.load(extra_streams + tile, mask=valid, other=0).to(tl.int32)
-        start = tl.load(extra_starts + tile, mask=valid, other=N_STEPS).to(tl.int32)
-        fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0).to(tl.int32)
-    block = stream // N_LANES
-    lane = stream - block * N_LANES
-    block_base = block * BLOCK
-    # Absolute rows keep adjacent source lanes together even when streams
-    # have different overflow starts. Process several rows per iteration.
+    """Copy the tail bytes of one set of overflowing lanes, one row tile deep."""
+    # The rows start close to the set's own smallest overflow step instead of
+    # at the whole block's minimum.
     first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
+    block_base = block_id * BLOCK
     row_offsets = tl.arange(0, ROW_TILE)
-    for first in tl.range(first_step, N_STEPS, ROW_TILE):
-        row = first + row_offsets
-        source_offset = block_base[None, :] + row[:, None] * N_LANES + lane[None, :]
+    for row_first in tl.range(first_step, N_STEPS, ROW_TILE):
+        row = row_first + row_offsets
+        source_offset = block_base + row[:, None] * N_LANES + lane[None, :]
         active = (
             valid[None, :] & (row[:, None] >= start[None, :])
             & (row[:, None] < N_STEPS) & (source_offset < n_elements)
         )
-        logical_n = block[None, :] * N_STEPS + row[:, None]
-        logical_k = swizzle_lane(block[None, :] * N_STEPS, row[:, None], lane[None, :])
+        logical_n = block_id * N_STEPS + row[:, None]
+        logical_k = swizzle_lane(block_id * N_STEPS, row[:, None], lane[None, :])
         input_offset = logical_n * N_LANES + logical_k
         value = tl.load(
             source_bits + input_offset,
@@ -151,37 +129,110 @@ def _compact_extra_impl(
         else:
             values = (((value >> 7) & 255) - 127).to(tl.int8)
         destination = fallback_offset[None, :] + row[:, None] - start[None, :]
-        if BUFFERED:
-            tl.store(fallback_data + fallback_base + destination, values, mask=active)
-        else:
-            tl.store(fallback_data + destination, values, mask=active)
+        tl.store(tail + tail_off + destination, values, mask=active)
+
+
+@triton.jit
+def _compact_extra_impl(
+    source_bits,
+    lanes, starts, tail, descriptor, fallback_count, blocks,
+    fallback_base, n_blocks, n_elements,
+    extra_starts, summaries, n_streams,
+    BUFFERED: tl.constexpr, PRECOMPUTED: tl.constexpr,
+    LOGICAL_NUMEL: tl.constexpr, BUILD_META: tl.constexpr,
+    BLOCK: tl.constexpr, N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
+    ROW_TILE: tl.constexpr, block_id,
+):
+    if BUFFERED:
+        total = tl.load(fallback_count).to(tl.int32)
+        base = tl.load(descriptor).to(tl.int32)
+        lane_off = base
+        start_off = base + total
+        tail_off = base + 2 * total
+    else:
+        lane_off = 0
+        start_off = 0
+        tail_off = fallback_base
+    if BUILD_META:
+        # Publish this block's compact entries and its slice positions, so the
+        # summaries path needs only one launch per block. The tail copy takes
+        # the overflow steps straight from extra_starts in registers rather
+        # than reading back the lanes/starts this program is about to write,
+        # which would be an unsynchronised cross-thread read of its own stores.
+        count = tl.load(summaries + block_id).to(tl.int32)
+        first = tl.load(summaries + 2 * n_blocks + block_id).to(tl.int32)
+        byte_base = tl.load(summaries + 3 * n_blocks + block_id).to(tl.int32)
+        if count > 0:
+            lane = tl.arange(0, N_LANES)
+            stream = block_id * N_LANES + lane
+            start = tl.load(extra_starts + stream).to(tl.int32)
+            bad = (stream < n_streams) & (start != 255)
+            length = tl.where(bad, N_STEPS - start, 0)
+            local = tl.cumsum(length, axis=0) - length
+            _compact_extra_rows(
+                source_bits, tail, tail_off, n_elements, block_id,
+                lane, start, bad, byte_base + local,
+                PRECOMPUTED, LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS, ROW_TILE,
+            )
+            bad_i = bad.to(tl.int32)
+            rank = tl.cumsum(bad_i, axis=0) - bad_i
+            pos = first + rank
+            if BUFFERED:
+                tl.store(lanes + base + pos, lane.to(tl.uint8), mask=bad)
+                tl.store(starts + base + total + pos, start.to(tl.uint8), mask=bad)
+            else:
+                tl.store(lanes + pos, lane.to(tl.uint8), mask=bad)
+                tl.store(starts + pos, start.to(tl.uint8), mask=bad)
+        # Every block publishes its own slice positions, including empty blocks.
+        tl.store(blocks + block_id, count)
+        tl.store(blocks + n_blocks + block_id, first)
+        tl.store(blocks + 2 * n_blocks + block_id, byte_base)
+        return
+    count = tl.load(blocks + block_id).to(tl.int32)
+    if count == 0:
+        return
+    first = tl.load(blocks + n_blocks + block_id).to(tl.int32)
+    byte_base = tl.load(blocks + 2 * n_blocks + block_id).to(tl.int32)
+    # A block's entries are contiguous and in increasing lane order, so one
+    # N_LANES-wide pass visits all of them and the running offset is just the
+    # prefix sum of the tail lengths in that order.
+    k = tl.arange(0, N_LANES)
+    valid = k < count
+    lane = tl.load(lanes + lane_off + first + k, mask=valid, other=0).to(tl.int32)
+    start = tl.load(
+        starts + start_off + first + k, mask=valid, other=N_STEPS,
+    ).to(tl.int32)
+    length = tl.where(valid, N_STEPS - start, 0)
+    local = tl.cumsum(length, axis=0) - length
+    _compact_extra_rows(
+        source_bits, tail, tail_off, n_elements, block_id,
+        lane, start, valid, byte_base + local,
+        PRECOMPUTED, LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS, ROW_TILE,
+    )
 
 
 @triton.autotune(
     configs=COMPACT_EXTRA_AUTOTUNE_CONFIGS,
-    key=["n_elements", "N_LANES", "N_STEPS", "BLOCK", "PRECOMPUTED"],
+    key=["n_elements", "N_LANES", "N_STEPS", "BLOCK", "PRECOMPUTED", "BUILD_META"],
 )
 @triton.jit
 def _compact_extra_kernel(
-    source_bits, extra_streams, extra_starts,
-    fallback_offsets, fallback_data, metadata_buffer,
-    allocation_descriptor, final_counts, bad_count, n_elements,
+    source_bits, lanes, starts, tail, descriptor, fallback_count, blocks,
+    fallback_base, n_blocks, n_elements,
+    extra_starts, summaries, n_streams,
     BUFFERED: tl.constexpr, PRECOMPUTED: tl.constexpr, LOGICAL_NUMEL: tl.constexpr,
+    BUILD_META: tl.constexpr,
     BLOCK: tl.constexpr, N_LANES: tl.constexpr,
-    N_STEPS: tl.constexpr, TILE: tl.constexpr,
-    ROW_TILE: tl.constexpr,
+    N_STEPS: tl.constexpr, ROW_TILE: tl.constexpr,
 ):
-    """Compact overflow exponents from BF16 bits or precomputed exponent bytes."""
-    # Specialize input extraction while sharing the persistent tile traversal.
-    count = tl.load(final_counts if BUFFERED else bad_count).to(tl.int32)
-    for tile_id in tl.range(tl.program_id(0), tl.cdiv(count, TILE), tl.num_programs(0)):
-        _compact_extra_impl(
-            source_bits, extra_streams, extra_starts, fallback_offsets,
-            fallback_data, metadata_buffer, allocation_descriptor,
-            final_counts, bad_count, n_elements, BUFFERED, PRECOMPUTED,
-            LOGICAL_NUMEL, BLOCK, N_LANES, N_STEPS, TILE, ROW_TILE,
-            tile_id,
-        )
+    """Compact overflow tails, and optionally this block's metadata, per block."""
+    _compact_extra_impl(
+        source_bits, lanes, starts, tail, descriptor, fallback_count, blocks,
+        fallback_base, n_blocks, n_elements, extra_starts, summaries, n_streams,
+        BUFFERED, PRECOMPUTED,
+        LOGICAL_NUMEL, BUILD_META, BLOCK, N_LANES, N_STEPS, ROW_TILE,
+        tl.program_id(0),
+    )
 
 
 @triton.autotune(
@@ -190,64 +241,66 @@ def _compact_extra_kernel(
 )
 @triton.jit
 def _scatter_blocked_fallback_kernel(
-    bad_streams, bad_starts, fallback_offsets,
-    fallback_buffer, fallback_base, metadata, descriptor, fallback_count,
+    lanes, starts, tail, descriptor, fallback_count, blocks,
+    fallback_base,
     sign_mantissa, output, n_elements,
     BUFFERED: tl.constexpr,
     LOGICAL_NUMEL: tl.constexpr,
-    TILE: tl.constexpr, BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
     N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
     ROW_TILE: tl.constexpr,
 ):
     """Overwrite mapped decode output with compact fallback stream tails."""
-    count = tl.load(fallback_count).to(tl.int32)
-    for tile_id in tl.range(tl.program_id(0), tl.cdiv(count, TILE), tl.num_programs(0)):
-        # Load stream metadata from the selected fallback storage layout.
-        tile = tile_id * TILE + tl.arange(0, TILE)
-        valid = tile < count
-        if BUFFERED:
-            base = tl.load(descriptor).to(tl.int32)
-            base_words = base // 4
-            stream = tl.load(metadata + base_words + tile, mask=valid, other=0)
-            start = tl.load(
-                bad_starts + base + 8 * count + tile,
-                mask=valid, other=N_STEPS,
-            )
-            fallback_offset = tl.load(
-                metadata + base_words + count + tile, mask=valid, other=0,
-            )
-            tail_base = base + 9 * count
-        else:
-            stream = tl.load(bad_streams + tile, mask=valid, other=0)
-            start = tl.load(bad_starts + tile, mask=valid, other=N_STEPS)
-            fallback_offset = tl.load(fallback_offsets + tile, mask=valid, other=0)
-            tail_base = fallback_base
+    block_id = tl.program_id(0)
+    n_blocks = tl.num_programs(0)
+    if BUFFERED:
+        total = tl.load(fallback_count).to(tl.int32)
+        base = tl.load(descriptor).to(tl.int32)
+        lane_off = base
+        start_off = base + total
+        tail_off = base + 2 * total
+        tail_ptr = tail
+    else:
+        lane_off = 0
+        start_off = 0
+        tail_off = fallback_base
+        tail_ptr = tail
 
-        # Skip inactive prefixes, then restore several absolute rows at once.
-        stream = stream.to(tl.int32)
-        start = start.to(tl.int32)
-        fallback_offset = fallback_offset.to(tl.int32)
-        block = stream // N_LANES
-        lane = stream % N_LANES
-        block_base = block * BLOCK
-        first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
-        row_offsets = tl.arange(0, ROW_TILE)
-        for first in tl.range(first_step, N_STEPS, ROW_TILE):
-            row = first + row_offsets
-            storage_offset = block_base[None, :] + row[:, None] * N_LANES + lane[None, :]
-            logical_n = block[None, :] * N_STEPS + row[:, None]
-            logical_k = swizzle_lane(block[None, :] * N_STEPS, row[:, None], lane[None, :])
-            logical_offset = logical_n * N_LANES + logical_k
-            active = (
-                valid[None, :] & (row[:, None] >= start[None, :])
-                & (row[:, None] < N_STEPS) & (storage_offset < n_elements)
-                & (logical_offset < LOGICAL_NUMEL)
-            )
-            # Reassemble BF16 bits and write only active logical elements.
-            source_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
-            exponent = tl.load(
-                fallback_buffer + tail_base + source_offset,
-                mask=active, other=0,
-            ).to(tl.int32)
-            sm = tl.load(sign_mantissa + storage_offset, mask=active, other=0)
-            tl.store(output + logical_offset, pack_bf16(exponent, sm).to(tl.int16), mask=active)
+    count = tl.load(blocks + block_id).to(tl.int32)
+    if count == 0:
+        return
+    first = tl.load(blocks + n_blocks + block_id).to(tl.int32)
+    byte_base = tl.load(blocks + 2 * n_blocks + block_id).to(tl.int32)
+
+    k = tl.arange(0, N_LANES)
+    valid = k < count
+    lane = tl.load(lanes + lane_off + first + k, mask=valid, other=0).to(tl.int32)
+    start = tl.load(
+        starts + start_off + first + k, mask=valid, other=N_STEPS,
+    ).to(tl.int32)
+    length = tl.where(valid, N_STEPS - start, 0)
+    local = tl.cumsum(length, axis=0) - length
+    fallback_offset = byte_base + local
+
+    block_base = block_id * BLOCK
+    # Skip inactive prefixes, then restore several absolute rows at once.
+    first_step = tl.min(tl.where(valid, start, N_STEPS), axis=0)
+    row_offsets = tl.arange(0, ROW_TILE)
+    for row_first in tl.range(first_step, N_STEPS, ROW_TILE):
+        row = row_first + row_offsets
+        storage_offset = block_base + row[:, None] * N_LANES + lane[None, :]
+        logical_n = block_id * N_STEPS + row[:, None]
+        logical_k = swizzle_lane(block_id * N_STEPS, row[:, None], lane[None, :])
+        logical_offset = logical_n * N_LANES + logical_k
+        active = (
+            valid[None, :] & (row[:, None] >= start[None, :])
+            & (row[:, None] < N_STEPS) & (storage_offset < n_elements)
+            & (logical_offset < LOGICAL_NUMEL)
+        )
+        # Reassemble BF16 bits and write only active logical elements.
+        source_offset = fallback_offset[None, :] + row[:, None] - start[None, :]
+        exponent = tl.load(
+            tail_ptr + tail_off + source_offset, mask=active, other=0,
+        ).to(tl.int32)
+        sm = tl.load(sign_mantissa + storage_offset, mask=active, other=0)
+        tl.store(output + logical_offset, pack_bf16(exponent, sm).to(tl.int16), mask=active)

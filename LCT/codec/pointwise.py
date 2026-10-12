@@ -7,21 +7,17 @@ import triton
 from ..comp_tensor import CompressedTensor
 from ..comp_format import Distribution, StorageLayout
 from ..compression.huffman_tables import FIRST_BITS, FIRST_MASK, get_distribution_tables
-from .autotune import SCATTER_GRID_LIMIT
 from .encode import encode as compress_dense, encode_components as compress_components
-from .decode import decode as decode_dense
+from .decode import (
+    _storage as _fallback_storage,
+    decode as decode_dense,
+    has_fallback,
+)
 from .geometry import geometry
-from ..kernels.common.tables import _shift_decoding_table_kernel
+from ..kernels import dispatch
 from ..kernels.generic.pointwise import (
     COMPRESSED_OUTPUT, DENSE_OUTPUT,
-    pointwise_compressed_dense_fallback_kernel,
-    pointwise_compressed_dense_kernel,
     add_op, multiply_op, _scaled_sum,
-)
-from ..kernels.generic.pointwise_scalar_dual import (
-    _initialize_dual_maps_kernel,
-    _prepare_dual_tables_and_maps_kernel,
-    pointwise_scalar_mul_add_compressed_compressed_mapped_kernel,
 )
 from ..tensor_buffer import TensorBuffer
 if TYPE_CHECKING:
@@ -51,13 +47,9 @@ def _launch_pointwise_compressed_dense(
     # Prepare the decode table and flattened dense operand.
     other = other.contiguous().view(-1)
     _, decode_table, rare_length = get_distribution_tables(data.distribution)
-    shifted_decode = torch.empty(
-        1 << FIRST_BITS, dtype=torch.int32, device=data.data.device,
-    )
-    _shift_decoding_table_kernel[(1,)](
-        decode_table, data.center, shifted_decode,
-        BLOCK=1 << FIRST_BITS,
-    )
+    shifted_decode = data.decode_table
+    if shifted_decode is None:
+        shifted_decode = dispatch.shift_decoding_table(decode_table, data.center)
     block_symbols, lanes, steps, fixed_words = data.codec_geometry
     blocks = triton.cdiv(data.size, block_symbols)
     # Allocate dense values or the components consumed by the encoder.
@@ -74,54 +66,22 @@ def _launch_pointwise_compressed_dense(
         auxiliary = torch.empty_like(output)
 
     # Decode fixed streams and apply the selected operation.
-    main_args = (
-        data.data, data.sign_mantissa, other, output, auxiliary,
-        shifted_decode, data.size, blocks * lanes, data.center,
-        *operation_args,
-    )
-    main_meta = dict(
-        **operation_meta, OUTPUT_POLICY=output_policy,
-        FIRST_MASK=FIRST_MASK, RARE_LENGTH=rare_length,
-        BLOCK=block_symbols, N_LANES=lanes, N_STEPS=steps,
-        FIXED_WORDS=fixed_words,
-    )
-    pointwise_compressed_dense_kernel[(blocks,)](
-        *main_args, LOGICAL_NUMEL=data.logical_numel, **main_meta,
+    dispatch.pointwise_dense(
+        data.data, data.sign_mantissa, other, output, auxiliary, shifted_decode,
+        data.size, blocks * lanes, data.center, *operation_args,
+        rare_length=rare_length, logical_numel=data.logical_numel,
+        block_symbols=block_symbols, lanes=lanes, steps=steps,
+        fixed_words=fixed_words, output_policy=output_policy,
+        operation_meta=operation_meta,
     )
     # Correct overflow rows using the input's fallback storage layout.
-    if data.fallback_descriptor is not None:
-        metadata = data.fallback_buffer.view(torch.int32)
-        fallback_args = (
-            metadata, data.fallback_buffer, metadata, data.fallback_buffer, 0,
-            metadata, data.fallback_descriptor, data.fallback_count,
-            data.sign_mantissa, other, output, auxiliary, data.size,
-            *operation_args,
-        )
-        fallback_meta = dict(
-            **operation_meta, OUTPUT_POLICY=output_policy,
-            BUFFERED=True, TILE=64, BLOCK=block_symbols,
-            N_LANES=lanes, N_STEPS=steps,
-        )
-        fallback_grid = (min(triton.cdiv(blocks * lanes, 64), SCATTER_GRID_LIMIT),)
-        pointwise_compressed_dense_fallback_kernel[fallback_grid](
-            *fallback_args, LOGICAL_NUMEL=data.logical_numel, **fallback_meta,
-        )
-    elif data.offsets.numel():
-        fallback_args = (
-            data.offsets, data.fallback_starts, data.fallback_offsets,
-            data.fallback_buffer, data.fallback_base, data.offsets,
-            data.offsets, data.fallback_count, data.sign_mantissa,
-            other, output, auxiliary, data.size,
-            *operation_args,
-        )
-        fallback_meta = dict(
-            **operation_meta, OUTPUT_POLICY=output_policy,
-            BUFFERED=False, TILE=64, BLOCK=block_symbols,
-            N_LANES=lanes, N_STEPS=steps,
-        )
-        fallback_grid = (min(triton.cdiv(data.offsets.numel(), 64), SCATTER_GRID_LIMIT),)
-        pointwise_compressed_dense_fallback_kernel[fallback_grid](
-            *fallback_args, LOGICAL_NUMEL=data.logical_numel, **fallback_meta,
+    if has_fallback(data):
+        dispatch.pointwise_fallback(
+            _fallback_storage(data), data.sign_mantissa, other, output, auxiliary,
+            data.size, *operation_args,
+            logical_numel=data.logical_numel,
+            block_symbols=block_symbols, lanes=lanes, steps=steps,
+            output_policy=output_policy, operation_meta=operation_meta,
         )
     return output, auxiliary
 
@@ -142,7 +102,7 @@ def _launch_scalar_mul_add_compressed_compressed(
         1 << FIRST_BITS, dtype=torch.int32, device=data.data.device,
     )
     b_shifted_decode = torch.empty(
-        1 << FIRST_BITS, dtype=torch.int32, device=data.data.device,
+        1 << FIRST_BITS, dtype=torch.int32, device=other.data.device,
     )
     block_symbols, lanes, steps, fixed_words = data.codec_geometry
     blocks = triton.cdiv(data.size, block_symbols)
@@ -161,68 +121,37 @@ def _launch_scalar_mul_add_compressed_compressed(
 
     # The caller guarantees both operands use the same fallback storage mode.
     buffered = data.fallback_descriptor is not None
-    a_metadata = data.fallback_buffer.view(torch.int32) if buffered else data.offsets
-    b_metadata = other.fallback_buffer.view(torch.int32) if buffered else other.offsets
-    a_bad_streams = a_metadata
-    b_bad_streams = b_metadata
-    a_bad_starts = data.fallback_buffer if buffered else data.fallback_starts
-    b_bad_starts = other.fallback_buffer if buffered else other.fallback_starts
-    a_fb_offsets = data.fallback_offsets if not buffered else a_metadata
-    b_fb_offsets = other.fallback_offsets if not buffered else b_metadata
-    a_descriptor = data.fallback_descriptor if buffered else data.offsets
-    b_descriptor = other.fallback_descriptor if buffered else other.offsets
+    a_storage = _fallback_storage(data)
+    b_storage = _fallback_storage(other)
 
     streams = blocks * lanes
-
-    # Direct maps avoid scanning the full fallback list in every codec block.
-    # Initialize before scattering metadata so the launches cannot race.
     a_stream_starts = torch.empty(streams, dtype=torch.int32, device=data.data.device)
     a_stream_offsets = torch.empty(streams, dtype=torch.int32, device=data.data.device)
     b_stream_starts = torch.empty(streams, dtype=torch.int32, device=other.data.device)
     b_stream_offsets = torch.empty(streams, dtype=torch.int32, device=other.data.device)
 
-    _initialize_dual_maps_kernel[(triton.cdiv(streams, 1024),)](
+    # Direct maps avoid scanning the full fallback list in every codec block.
+    # Initialize before scattering metadata so the launches cannot race.
+    dispatch.dual_maps_init(
         a_stream_starts, a_stream_offsets, b_stream_starts, b_stream_offsets,
-        data.fallback_count, other.fallback_count, streams,
-        N_STEPS=steps, BLOCK=1024,
+        data.fallback_count, other.fallback_count, streams, steps,
     )
-    map_grid = (2 + min(triton.cdiv(streams, 1024), SCATTER_GRID_LIMIT),)
-    _prepare_dual_tables_and_maps_kernel[map_grid](
+    dispatch.dual_tables_and_maps(
         a_decode_table, data.center, a_shifted_decode,
         b_decode_table, other.center, b_shifted_decode,
-        a_bad_streams, a_bad_starts, a_fb_offsets, a_metadata,
-        a_descriptor, data.fallback_count,
-        a_stream_starts, a_stream_offsets,
-        b_bad_streams, b_bad_starts, b_fb_offsets, b_metadata,
-        b_descriptor, other.fallback_count,
-        b_stream_starts, b_stream_offsets,
-        N_SHIFT=2,
-        BLOCK=1 << FIRST_BITS,
-        BUFFERED=buffered,
+        a_storage, b_storage,
+        a_stream_starts, a_stream_offsets, b_stream_starts, b_stream_offsets,
+        blocks, lanes=lanes, steps=steps, buffered=buffered,
     )
-
-    mapped_meta = dict(
-        BUFFERED=buffered,
-        OUTPUT_POLICY=output_policy,
-        LOGICAL_NUMEL=data.logical_numel,
-        FIRST_MASK=FIRST_MASK, RARE_LENGTH=rare_length_a,
-        BLOCK=block_symbols, N_LANES=lanes, N_STEPS=steps,
-        FIXED_WORDS=fixed_words,
-    )
-    pointwise_scalar_mul_add_compressed_compressed_mapped_kernel[(blocks,)](
+    dispatch.dual_mapped(
         data.data, data.sign_mantissa, a_shifted_decode, data.center,
-        a_stream_starts, a_stream_offsets,
-        a_bad_streams, a_bad_starts, a_fb_offsets, a_metadata,
-        a_descriptor, data.fallback_count,
-        data.fallback_buffer, data.fallback_base,
+        a_stream_starts, a_stream_offsets, a_storage,
         other.data, other.sign_mantissa, b_shifted_decode, other.center,
-        b_stream_starts, b_stream_offsets,
-        b_bad_streams, b_bad_starts, b_fb_offsets, b_metadata,
-        b_descriptor, other.fallback_count,
-        other.fallback_buffer, other.fallback_base,
-        output, auxiliary, alpha,
-        data.size, streams,
-        **mapped_meta,
+        b_stream_starts, b_stream_offsets, b_storage,
+        output, auxiliary, alpha, data.size, streams, blocks,
+        rare_length=rare_length_a, logical_numel=data.logical_numel,
+        buffered=buffered, block_symbols=block_symbols, lanes=lanes,
+        steps=steps, fixed_words=fixed_words, output_policy=output_policy,
     )
     return output, auxiliary
 

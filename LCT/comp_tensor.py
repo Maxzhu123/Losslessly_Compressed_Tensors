@@ -14,15 +14,16 @@ class CompressedTensor:
     data: torch.Tensor  # Fixed exponent payload or source fallback.
     size: int  # Number of elements represented by codec storage, including padding.
     sign_mantissa: torch.Tensor | None = None  # Raw sign + 7-bit mantissa.
-    offsets: torch.Tensor | None = None  # Overflowing stream IDs.
+    # Legacy constructor slots; new tensors use compact lane/start metadata.
+    offsets: torch.Tensor | None = None
     fallback_starts: torch.Tensor | None = None  # First fallback step per stream.
-    fallback_offsets: torch.Tensor | None = None  # Offsets into fallback storage.
-    fallback_buffer: torch.Tensor | None = None  # Shared or private fallback storage.
+    fallback_offsets: torch.Tensor | None = None
+    fallback_buffer: torch.Tensor | None = None  # Shared or private tail storage.
     fallback_descriptor: torch.Tensor | None = None  # Device allocator descriptor.
-    buffer: TensorBuffer | None = None  # Allocator that owns fallback_descriptor.
-    fallback_base: int = 0  # Byte offset of this tensor's region in fallback_buffer.
-    fallback_count: torch.Tensor | None = None  # Device scalar with the number of fallback streams.
-    fallback_used: torch.Tensor | None = None  # Device scalar with actual fallback bytes used.
+    buffer: TensorBuffer | None = None
+    fallback_base: int = 0
+    fallback_count: torch.Tensor | None = None
+    fallback_used: torch.Tensor | None = None
     distribution: Distribution = field(
         default_factory=Distribution
     )  # Huffman table selector.
@@ -30,10 +31,17 @@ class CompressedTensor:
     shape: tuple[int, ...] = ()  # Original tensor shape.
     layout: StorageLayout = StorageLayout.RAW
     stream_geometry: tuple[int, int, int, int] | None = None
+    # One overflow format on every GPU: uint8 lane/start pairs and one
+    # int32 count/first-entry/tail-base triple per storage block.
+    fallback_lanes: torch.Tensor | None = None
+    fallback_blocks: torch.Tensor | None = None
+    decode_table: torch.Tensor | None = None  # Shifted table, built at encode time.
 
     @property
     def codec_geometry(self) -> tuple[int, int, int, int]:
         """Stored layout, independent of the GPU used to read this tensor."""
+        if self.layout == StorageLayout.COMPRESSED and self.fallback_blocks is None:
+            raise ValueError("legacy compressed layout: decode with the original codec and recompress")
         if self.stream_geometry is not None:
             return self.stream_geometry
         # Tensors created before GPU-specific geometry use the original layout.

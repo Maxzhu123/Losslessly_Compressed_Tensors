@@ -4,11 +4,10 @@ Computes ``output = alpha * a + b`` without materialising either operand as a
 dense tensor. Per-stream maps let the main kernel read either fixed payload
 or overflow storage, supporting private and buffered allocations.
 """
-
 import triton
 from triton import language as tl
 
-from ...codec.autotune import DUAL_DECODE_AUTOTUNE_CONFIGS
+from ..autotune import DUAL_DECODE_AUTOTUNE_CONFIGS
 from ..common.tables import _shift_decoding_table_impl
 from ..primitives import decode_symbol, pack_bf16
 from .layout import swizzle_lane
@@ -22,9 +21,6 @@ def _initialize_dual_maps_kernel(
     N_STEPS: tl.constexpr, BLOCK: tl.constexpr,
 ):
     """Initialize both operands' maps in one launch when the decoder needs them."""
-    count = tl.load(a_fallback_count) + tl.load(b_fallback_count)
-    if count <= 16:
-        return
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = idx < n_streams
     tl.store(a_stream_starts + idx, N_STEPS, mask=valid)
@@ -37,19 +33,22 @@ def _initialize_dual_maps_kernel(
 def _prepare_dual_tables_and_maps_kernel(
     a_decode_table, a_center, a_shifted_decode,
     b_decode_table, b_center, b_shifted_decode,
-    a_bad_streams, a_bad_starts, a_fallback_offsets, a_metadata,
-    a_descriptor, a_fallback_count,
+    a_lanes, a_starts, a_descriptor, a_blocks, a_fallback_count,
     a_stream_starts, a_stream_offsets,
-    b_bad_streams, b_bad_starts, b_fallback_offsets, b_metadata,
-    b_descriptor, b_fallback_count,
+    b_lanes, b_starts, b_descriptor, b_blocks, b_fallback_count,
     b_stream_starts, b_stream_offsets,
     N_SHIFT: tl.constexpr,
     BLOCK: tl.constexpr,
+    N_STEPS: tl.constexpr,
+    N_LANES: tl.constexpr,
     BUFFERED: tl.constexpr,
 ):
-    """Shift both decode tables and build both fallback maps in one launch."""
-    pid = tl.program_id(0)
+    """Shift both decode tables and expand both compact fallback lists.
 
+    One program handles one storage block of each operand, matching the
+    per-block layout written by the encoder's compaction pass.
+    """
+    pid = tl.program_id(0)
     if pid < N_SHIFT:
         if pid == 0:
             base_decode = a_decode_table
@@ -63,44 +62,57 @@ def _prepare_dual_tables_and_maps_kernel(
         _shift_decoding_table_impl(base_decode, center_value, shifted_decode, BLOCK)
         return
 
-    a_count = tl.load(a_fallback_count).to(tl.int32)
-    b_count = tl.load(b_fallback_count).to(tl.int32)
-    if a_count + b_count <= 16:
-        return
-    # A separate initialization launch precedes these disjoint scatter writes.
-    # Iterate over the actual GPU counts instead of every possible stream.
-    tiles = tl.cdiv(tl.maximum(a_count, b_count), 1024)
-    for tile in tl.range(pid - N_SHIFT, tiles, tl.num_programs(0) - N_SHIFT):
-        offs = tile * 1024 + tl.arange(0, 1024)
-        a_valid = offs < a_count
-        if tl.sum(a_valid.to(tl.int32)) > 0:
-            if BUFFERED:
-                base = tl.load(a_descriptor).to(tl.int32)
-                base_words = base // 4
-                stream = tl.load(a_metadata + base_words + offs, mask=a_valid, other=0).to(tl.int32)
-                start = tl.load(a_bad_starts + base + 8 * a_count + offs, mask=a_valid, other=0).to(tl.int32)
-                offset = tl.load(a_metadata + base_words + a_count + offs, mask=a_valid, other=0).to(tl.int32)
-            else:
-                stream = tl.load(a_bad_streams + offs, mask=a_valid, other=0).to(tl.int32)
-                start = tl.load(a_bad_starts + offs, mask=a_valid, other=0).to(tl.int32)
-                offset = tl.load(a_fallback_offsets + offs, mask=a_valid, other=0).to(tl.int32)
-            tl.store(a_stream_starts + stream, start, mask=a_valid)
-            tl.store(a_stream_offsets + stream, offset, mask=a_valid)
+    n_blocks = tl.num_programs(0) - N_SHIFT
+    block = pid - N_SHIFT
+    if BUFFERED:
+        a_total = tl.load(a_fallback_count).to(tl.int32)
+        a_base = tl.load(a_descriptor).to(tl.int32)
+        a_lane_off = a_base
+        a_start_off = a_base + a_total
+        b_total = tl.load(b_fallback_count).to(tl.int32)
+        b_base = tl.load(b_descriptor).to(tl.int32)
+        b_lane_off = b_base
+        b_start_off = b_base + b_total
+    else:
+        a_lane_off = 0
+        a_start_off = 0
+        b_lane_off = 0
+        b_start_off = 0
 
-        b_valid = offs < b_count
-        if tl.sum(b_valid.to(tl.int32)) > 0:
-            if BUFFERED:
-                base = tl.load(b_descriptor).to(tl.int32)
-                base_words = base // 4
-                stream = tl.load(b_metadata + base_words + offs, mask=b_valid, other=0).to(tl.int32)
-                start = tl.load(b_bad_starts + base + 8 * b_count + offs, mask=b_valid, other=0).to(tl.int32)
-                offset = tl.load(b_metadata + base_words + b_count + offs, mask=b_valid, other=0).to(tl.int32)
-            else:
-                stream = tl.load(b_bad_streams + offs, mask=b_valid, other=0).to(tl.int32)
-                start = tl.load(b_bad_starts + offs, mask=b_valid, other=0).to(tl.int32)
-                offset = tl.load(b_fallback_offsets + offs, mask=b_valid, other=0).to(tl.int32)
-            tl.store(b_stream_starts + stream, start, mask=b_valid)
-            tl.store(b_stream_offsets + stream, offset, mask=b_valid)
+    k = tl.arange(0, N_LANES)
+    a_count = tl.load(a_blocks + block).to(tl.int32)
+    if a_count > 0:
+        a_first = tl.load(a_blocks + n_blocks + block).to(tl.int32)
+        a_byte = tl.load(a_blocks + 2 * n_blocks + block).to(tl.int32)
+        a_valid = k < a_count
+        a_lane = tl.load(
+            a_lanes + a_lane_off + a_first + k, mask=a_valid, other=0,
+        ).to(tl.int32)
+        a_st = tl.load(
+            a_starts + a_start_off + a_first + k, mask=a_valid, other=N_STEPS,
+        ).to(tl.int32)
+        a_len = tl.where(a_valid, N_STEPS - a_st, 0)
+        a_local = tl.cumsum(a_len, axis=0) - a_len
+        a_stream = block * N_LANES + a_lane
+        tl.store(a_stream_starts + a_stream, a_st, mask=a_valid)
+        tl.store(a_stream_offsets + a_stream, a_byte + a_local, mask=a_valid)
+
+    b_count = tl.load(b_blocks + block).to(tl.int32)
+    if b_count > 0:
+        b_first = tl.load(b_blocks + n_blocks + block).to(tl.int32)
+        b_byte = tl.load(b_blocks + 2 * n_blocks + block).to(tl.int32)
+        b_valid = k < b_count
+        b_lane = tl.load(
+            b_lanes + b_lane_off + b_first + k, mask=b_valid, other=0,
+        ).to(tl.int32)
+        b_st = tl.load(
+            b_starts + b_start_off + b_first + k, mask=b_valid, other=N_STEPS,
+        ).to(tl.int32)
+        b_len = tl.where(b_valid, N_STEPS - b_st, 0)
+        b_local = tl.cumsum(b_len, axis=0) - b_len
+        b_stream = block * N_LANES + b_lane
+        tl.store(b_stream_starts + b_stream, b_st, mask=b_valid)
+        tl.store(b_stream_offsets + b_stream, b_byte + b_local, mask=b_valid)
 
 
 @triton.autotune(
@@ -111,12 +123,10 @@ def _prepare_dual_tables_and_maps_kernel(
 def pointwise_scalar_mul_add_compressed_compressed_mapped_kernel(
     a_encoded, a_sign_mantissa, a_decode_table, a_center,
     a_stream_starts, a_stream_offsets,
-    a_bad_streams, a_bad_starts, a_fallback_offsets, a_metadata,
     a_descriptor, a_fallback_count,
     a_fallback_buffer, a_fallback_base,
     b_encoded, b_sign_mantissa, b_decode_table, b_center,
     b_stream_starts, b_stream_offsets,
-    b_bad_streams, b_bad_starts, b_fallback_offsets, b_metadata,
     b_descriptor, b_fallback_count,
     b_fallback_buffer, b_fallback_base,
     output, auxiliary, alpha,
@@ -134,69 +144,20 @@ def pointwise_scalar_mul_add_compressed_compressed_mapped_kernel(
     lane_index = block * N_LANES + lanes
     stream = lane_index
 
+    # The compact fallback lists are always expanded into per-stream maps by
+    # _prepare_dual_tables_and_maps_kernel, so the main loop only reads them.
     a_count = tl.load(a_fallback_count).to(tl.int32)
     b_count = tl.load(b_fallback_count).to(tl.int32)
-
-    # For tiny fallback lists, the old per-block scan is cheaper than loading
-    # four per-stream arrays for every lane.  For large fallback lists, use
-    # the direct maps to avoid the O(blocks * fallback_count) scan.
-    use_maps = (a_count + b_count) > 16
-    if use_maps:
-        a_start = tl.load(a_stream_starts + stream).to(tl.int32)
-        a_offset = tl.load(a_stream_offsets + stream).to(tl.int32)
-        b_start = tl.load(b_stream_starts + stream).to(tl.int32)
-        b_offset = tl.load(b_stream_offsets + stream).to(tl.int32)
-
-        if BUFFERED:
-            a_real_base = tl.load(a_descriptor).to(tl.int32) + 9 * a_count
-            b_real_base = tl.load(b_descriptor).to(tl.int32) + 9 * b_count
-        else:
-            a_real_base = a_fallback_base
-            b_real_base = b_fallback_base
+    a_start = tl.load(a_stream_starts + stream).to(tl.int32)
+    a_offset = tl.load(a_stream_offsets + stream).to(tl.int32)
+    b_start = tl.load(b_stream_starts + stream).to(tl.int32)
+    b_offset = tl.load(b_stream_offsets + stream).to(tl.int32)
+    if BUFFERED:
+        a_real_base = tl.load(a_descriptor).to(tl.int32) + 2 * a_count
+        b_real_base = tl.load(b_descriptor).to(tl.int32) + 2 * b_count
     else:
-        a_start = tl.full((N_LANES,), N_STEPS, tl.int32)
-        b_start = tl.full((N_LANES,), N_STEPS, tl.int32)
-        a_offset = tl.zeros((N_LANES,), tl.int32)
-        b_offset = tl.zeros((N_LANES,), tl.int32)
-
-        if BUFFERED:
-            a_base = tl.load(a_descriptor).to(tl.int32)
-            a_base_words = a_base // 4
-            a_real_base = a_base + 9 * a_count
-            b_base = tl.load(b_descriptor).to(tl.int32)
-            b_base_words = b_base // 4
-            b_real_base = b_base + 9 * b_count
-            for i in tl.range(0, a_count):
-                a_sid = tl.load(a_metadata + a_base_words + i).to(tl.int32)
-                a_start_i = tl.load(a_bad_starts + a_base + 8 * a_count + i).to(tl.int32)
-                a_off = tl.load(a_metadata + a_base_words + a_count + i).to(tl.int32)
-                is_a = a_sid == stream
-                a_start = tl.where(is_a, a_start_i, a_start)
-                a_offset = tl.where(is_a, a_off, a_offset)
-            for i in tl.range(0, b_count):
-                b_sid = tl.load(b_metadata + b_base_words + i).to(tl.int32)
-                b_start_i = tl.load(b_bad_starts + b_base + 8 * b_count + i).to(tl.int32)
-                b_off = tl.load(b_metadata + b_base_words + b_count + i).to(tl.int32)
-                is_b = b_sid == stream
-                b_start = tl.where(is_b, b_start_i, b_start)
-                b_offset = tl.where(is_b, b_off, b_offset)
-        else:
-            a_real_base = a_fallback_base
-            b_real_base = b_fallback_base
-            for i in tl.range(0, a_count):
-                a_sid = tl.load(a_bad_streams + i).to(tl.int32)
-                a_start_i = tl.load(a_bad_starts + i).to(tl.int32)
-                a_off = tl.load(a_fallback_offsets + i).to(tl.int32)
-                is_a = a_sid == stream
-                a_start = tl.where(is_a, a_start_i, a_start)
-                a_offset = tl.where(is_a, a_off, a_offset)
-            for i in tl.range(0, b_count):
-                b_sid = tl.load(b_bad_streams + i).to(tl.int32)
-                b_start_i = tl.load(b_bad_starts + i).to(tl.int32)
-                b_off = tl.load(b_fallback_offsets + i).to(tl.int32)
-                is_b = b_sid == stream
-                b_start = tl.where(is_b, b_start_i, b_start)
-                b_offset = tl.where(is_b, b_off, b_offset)
+        a_real_base = a_fallback_base
+        b_real_base = b_fallback_base
 
     a_word = tl.zeros((N_LANES,), tl.int32)
     a_shift = tl.zeros((N_LANES,), tl.int32)

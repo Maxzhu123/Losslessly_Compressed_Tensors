@@ -1,14 +1,15 @@
-"""TileLang fixed-payload Huffman encoding kernel."""
-
+"""TileLang fixed-payload Huffman encoding kernel.
+"""
 import torch
 import tilelang
 import tilelang.language as T
 
+from ..generic.layout import swizzle_col, swizzle_row_mask
 from .autotune import encode_autotune_configs
-from .tilelang_utils import silence_autotune
+from .tilelang_utils import configure_autotune
 
 
-silence_autotune()
+configure_autotune()
 
 
 # Tile loading, consumption, and shared-buffer reuse have explicit barriers.
@@ -36,20 +37,19 @@ __device__ __forceinline__ unsigned lct_encode_side4(uint2 value) {
     unsigned hi = (value.y & 0x7f7f7f7fu) | ((value.y >> 8) & 0x80808080u);
     return __byte_perm(lo, hi, 0x6420);
 }
+// XOR swizzle: the destination of each column is not a shift of the source,
+// so the funnel-shift pack and the aligned vector store do not apply and every
+// side byte is scattered to its own column.
 __device__ __forceinline__ void lct_encode_stage4(
     unsigned char* exponents, unsigned char* side, const short* source, int col, int row_shift) {
     uint2 value = __ldcg(reinterpret_cast<const uint2*>(source));
     unsigned exp = __byte_perm(value.x >> 7, value.y >> 7, 0x6420);
     *reinterpret_cast<unsigned*>(exponents) = exp;
     unsigned current = lct_encode_side4(value);
-    unsigned previous = __shfl_up_sync(0xffffffffu, current, 1);
-    if ((threadIdx.x & 31) == 0) {
-        previous = lct_encode_side4(__ldcg(reinterpret_cast<const uint2*>(source + (col == 0 ? 252 : -4))));
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        side[(col + i) ^ row_shift] = (unsigned char)((current >> (i * 8)) & 255);
     }
-    int rotation = (-row_shift) & 3;
-    unsigned packed = rotation == 0 ? current : (current << (rotation * 8)) | (previous >> (32 - rotation * 8));
-    int destination = ((col - row_shift) & 255) & ~3;
-    __stcs(reinterpret_cast<unsigned*>(side + destination), packed);
 }
 __device__ __forceinline__ void lct_encode_stage8(
     unsigned char* exponents, unsigned char* side, const short* source, int col, int row_shift) {
@@ -60,17 +60,11 @@ __device__ __forceinline__ void lct_encode_stage8(
     *reinterpret_cast<uint2*>(exponents) = exp;
     unsigned lo = lct_encode_side4(make_uint2(value.x, value.y));
     unsigned hi = lct_encode_side4(make_uint2(value.z, value.w));
-    int rotation = (-row_shift) & 7;
-    int previous_lane = (threadIdx.x - 1) & 31;
-    unsigned previous_lo = __shfl_sync(0xffffffffu, lo, previous_lane);
-    unsigned previous_hi = __shfl_sync(0xffffffffu, hi, previous_lane);
-    unsigned a = rotation < 4 ? previous_hi : previous_lo;
-    unsigned b = rotation < 4 ? lo : previous_hi;
-    unsigned c = rotation < 4 ? hi : lo;
-    uint2 packed = make_uint2(__funnelshift_l(a, b, (rotation & 3) * 8),
-                             __funnelshift_l(b, c, (rotation & 3) * 8));
-    int destination = ((col - row_shift) & 255) & ~7;
-    __stcs(reinterpret_cast<uint2*>(side + destination), packed);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        side[(col + i) ^ row_shift] = (unsigned char)((lo >> (i * 8)) & 255);
+        side[(col + 4 + i) ^ row_shift] = (unsigned char)((hi >> (i * 8)) & 255);
+    }
 }
 """
 
@@ -153,7 +147,7 @@ def encode_kernel(source: torch.Tensor, side: torch.Tensor, encoded: torch.Tenso
                         if packed_fields:
                             if path == 0 or position - col + 255 < logical_numel:
                                 storage_row = block * block_symbols + (tile * row_tile + row) * lanes
-                                row_shift = (block * steps + tile * row_tile + row) & 255
+                                row_shift = swizzle_row_mask(block * steps + tile * row_tile + row)
                                 if vector_width == 8:
                                     T.evaluate(T.call_extern("handle", "lct_encode_stage8", T.address_of(source_tile[row, col]), T.address_of(side[storage_row]), T.address_of(source[position]), col, row_shift))
                                 else:
@@ -164,7 +158,7 @@ def encode_kernel(source: torch.Tensor, side: torch.Tensor, encoded: torch.Tenso
                                     if position + item < logical_numel:
                                         value = T.Cast("int32", source[position + item])
                                         source_tile[row, col + item] = T.Cast("uint8", (value >> 7) & 255)
-                                        storage_col = (col + item - (block * steps + tile * row_tile + row)) & 255
+                                        storage_col = swizzle_col(col + item, block * steps + tile * row_tile + row)
                                         storage_row = block * block_symbols + (tile * row_tile + row) * lanes
                                         side[storage_row + storage_col] = T.Cast("uint8", (value & 127) | ((value >> 8) & 128))
                         else:
@@ -190,11 +184,11 @@ def encode_kernel(source: torch.Tensor, side: torch.Tensor, encoded: torch.Tenso
                             if (not packed_fields and not precomputed) or start[owned] == 255:
                                 lane = thread + owned * threads
                                 logical_row = block * steps + tile * tile_rows + pair * 2
-                                input0 = logical_row * lanes + ((lane + logical_row) & 255)
-                                input1 = (logical_row + 1) * lanes + ((lane + logical_row + 1) & 255)
+                                input0 = logical_row * lanes + swizzle_col(lane, logical_row)
+                                input1 = (logical_row + 1) * lanes + swizzle_col(lane, logical_row + 1)
                                 storage0 = block * block_symbols + (tile * tile_rows + pair * 2) * lanes + lane
-                                value0[owned] = T.Cast("int32", source_tile[pair * 2, (lane + logical_row) & 255])
-                                value1[owned] = T.Cast("int32", source_tile[pair * 2 + 1, (lane + logical_row + 1) & 255])
+                                value0[owned] = T.Cast("int32", source_tile[pair * 2, swizzle_col(lane, logical_row)])
+                                value1[owned] = T.Cast("int32", source_tile[pair * 2 + 1, swizzle_col(lane, logical_row + 1)])
                                 if precomputed or packed_fields:
                                     byte0 = value0[owned] & 255
                                     byte1 = value1[owned] & 255

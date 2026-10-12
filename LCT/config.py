@@ -1,15 +1,31 @@
-"""Runtime settings for kernel dispatch.
+"""Explicit settings for LCT codecs and kernels.
 
-Set ``LCT.config.use_tilelang = False`` to use the Triton codec kernels.
-When enabled, TileLang is assumed to be installed and usable on the device.
+Edit these defaults or assign attributes before importing LCT's codec, kernel,
+or tensor modules::
+
+    from LCT import config
+    config.use_tilelang = True
+    from LCT.LCTensor import LCTTensor
+
+Lane mapping, geometry, and tuning profiles are selected at import time.
+Keep the lane mapping fixed while compressed tensors are in use.
 """
 
-import os
+from typing import Literal
 
-use_tilelang: bool = False
+# Even XOR masks keep adjacent lane pairs together while mixing columns.
+# Linear mapping requires statistically interchangeable columns.
+lane_mapping: Literal["swizzle", "linear"] = "swizzle"
 
-# Retune on each program run, retaining compiled kernels.
+# Empty detects the GPU; "generic" selects portable Triton tuning defaults.
+# GPU model keys and 3070/3090/4090/5090 aliases select a tuning override.
+kernel_backend: str = ""
+
+# Retune TileLang on each program run while retaining compiled kernels.
 reset_cache: bool = False
 
-if use_tilelang and reset_cache:
-    os.environ["TILELANG_AUTO_TUNING_DISABLE_CACHE"] = "1"
+# TileLang must be installed when enabled.
+use_tilelang: bool = False
+
+# Show TileLang autotuning progress and logs.
+tilelang_verbose: bool = False

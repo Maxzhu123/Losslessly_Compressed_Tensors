@@ -1,9 +1,9 @@
-"""Triton fixed-payload Huffman encoding kernel."""
-
+"""Triton fixed-payload Huffman encoding kernel.
+"""
 import triton
 from triton import language as tl
 
-from ...codec.autotune import ENCODE_AUTOTUNE_CONFIGS
+from ..autotune import ENCODE_AUTOTUNE_CONFIGS
 from .layout import swizzle_lane
 
 

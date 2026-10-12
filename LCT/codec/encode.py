@@ -1,4 +1,8 @@
-"""Shared BF16 encoding, allocation, and overflow storage pipeline."""
+"""Shared BF16 encoding, allocation, and overflow storage pipeline.
+
+All kernels use compact per-block overflow metadata. This module reserves
+private or shared storage and launches the same pipeline for every GPU.
+"""
 
 import torch
 import triton
@@ -7,60 +11,12 @@ from ..comp_format import Distribution, StorageLayout
 from ..comp_tensor import CompressedTensor
 from ..compression.huffman_tables import get_distribution_tables
 from ..tensor_buffer import Allocation, TensorBuffer
-from ..kernels.common.tables import (
-    _shift_encoding_table_kernel,
-    _estimate_and_shift_encoding_table_kernel,
-)
-from ..kernels.generic.compaction import (
-    _count_bad_streams_kernel, _compact_bad_streams_kernel,
-    _compact_extra_kernel,
-)
-from ..kernels.generic.metadata import _prefix_allocate_kernel, _compact_metadata_kernel
 from ..kernels import dispatch
-from .autotune import SUMMARY_BLOCK_LIMIT, COMPACT_GRID_LIMIT
+from ..kernels.backends import FallbackStorage
+from ..kernels.autotune import SUMMARY_BLOCK_LIMIT
 from .geometry import geometry
 
 CENTER_SAMPLE_SIZE = 4096
-
-
-def _compact_bad_streams(
-    extra_starts,
-    bad_streams_out, bad_starts_out, fallback_offsets_out,
-    metadata_buffer, allocation_descriptor, final_counts,
-    bad_count, fallback_total, streams, steps,
-    *,
-    buffered,
-):
-    """Compact overflow-stream metadata for a buffered or private fallback path."""
-    compact_grid = lambda meta: (triton.cdiv(streams, meta["BLOCK"]),)
-    _compact_bad_streams_kernel[compact_grid](
-        extra_starts, bad_streams_out, bad_starts_out, fallback_offsets_out,
-        metadata_buffer, allocation_descriptor, final_counts,
-        bad_count, fallback_total, streams, steps,
-        BUFFERED=buffered,
-    )
-
-
-def _compact_extra(
-    source_values,
-    bad_streams, bad_starts, fallback_offsets, fallback_data,
-    metadata_buffer, allocation_descriptor, final_counts, bad_count,
-    size, streams, *,
-    precomputed, buffered,
-    logical_numel,
-    block_symbols, lanes, steps,
-):
-    """Compact fallback tail values for a buffered or private fallback path."""
-    def compact_grid(meta):
-        return (min(triton.cdiv(streams, meta["TILE"]), COMPACT_GRID_LIMIT),)
-
-    _compact_extra_kernel[compact_grid](
-        source_values, bad_streams, bad_starts, fallback_offsets,
-        fallback_data, metadata_buffer, allocation_descriptor,
-        final_counts, bad_count, size,
-        BUFFERED=buffered, PRECOMPUTED=precomputed, LOGICAL_NUMEL=logical_numel,
-        BLOCK=block_symbols, N_LANES=lanes, N_STEPS=steps,
-    )
 
 
 def encode_components(
@@ -96,19 +52,20 @@ def encode_components(
     block_symbols, lanes, steps, fixed_words = stream_geometry
     blocks = triton.cdiv(size, block_symbols)
     streams = blocks * lanes
-    encode_table, _, _ = get_distribution_tables(distribution)
+    encode_table, decode_table, _ = get_distribution_tables(distribution)
     shifted_encode = torch.empty(256, dtype=torch.int32, device=source_values.device)
+    # Build once and reuse for decoding and fused pointwise reads.
+    shifted_decode = torch.empty_like(decode_table)
     if center is None:
         center = torch.empty(1, dtype=torch.int32, device=source_values.device)
-        _estimate_and_shift_encoding_table_kernel[(1,)](
+        dispatch.estimate_and_shift_encoding_table(
             source_values, center, logical_numel, encode_table, shifted_encode,
-            SAMPLE_SIZE=min(logical_numel, CENTER_SAMPLE_SIZE),
-            PRECOMPUTED=precomputed,
-            BLOCK=4096, num_warps=4, num_stages=2,
+            decode_table, shifted_decode,
+            min(logical_numel, CENTER_SAMPLE_SIZE), precomputed,
         )
     else:
-        _shift_encoding_table_kernel[(1,)](
-            encode_table, center, shifted_encode, BLOCK=256,
+        dispatch.shift_encoding_table(
+            encode_table, center, shifted_encode, decode_table, shifted_decode,
         )
     # Encode and decode share this sampled center through the result metadata.
     encoded = torch.empty(
@@ -119,7 +76,7 @@ def encode_components(
     extra_starts = torch.empty(
         streams, dtype=torch.uint8, device=source_values.device
     )
-    # Bound the single-program prefix scan; larger tensors keep the prior path.
+    # Bound the single-program prefix scan; larger tensors keep the atomic path.
     use_summaries = blocks <= SUMMARY_BLOCK_LIMIT
     summaries = (
         torch.empty(4 * blocks, dtype=torch.int32, device=source_values.device)
@@ -146,97 +103,84 @@ def encode_components(
             torch.empty(4, dtype=torch.int32, device=source_values.device)
             if buffer is not None else counts
         )
-        state = (
-            (buffer._free_starts, buffer._free_sizes, buffer._free_count,
-             buffer._lock, buffer._generation)
-            if buffer is not None else (counts,) * 5
-        )
-        _prefix_allocate_kernel[(1,)](
-            summaries, counts, descriptor, *state, blocks,
-            BUFFERED=buffer is not None, BLOCK=triton.next_power_of_2(blocks),
-            MAX_FREE_REGIONS=buffer.max_free_regions if buffer is not None else 256,
-            num_warps=4, num_stages=2,
+        dispatch.prefix_allocate(
+            summaries, counts, descriptor, buffer, blocks, buffer is not None,
+            buffer.max_free_regions if buffer is not None else 256,
         )
     else:
-        count_grid = lambda meta: (triton.cdiv(streams, meta["BLOCK"]),)
-        _count_bad_streams_kernel[count_grid](
+        dispatch.count_bad_streams(
             extra_starts, final_count, final_total, streams, steps,
         )
 
     buffered = buffer is not None
+    # Each overflowing stream stores a lane byte and a start byte.
+    blocks_out = torch.empty(
+        3 * blocks, dtype=torch.int32, device=source_values.device,
+    )
     if buffer is not None:
-        if use_summaries:
-            allocation = Allocation(descriptor, buffer)
-        else:
-            allocation = buffer.allocate_with_items(final_total, final_count, 9)
-        metadata = buffer.data.view(torch.int32)
-        fallback_buffer = buffer.data
-        bad_streams_out = metadata
-        bad_starts_out = buffer.data
-        fallback_offsets_out = metadata
-        metadata_buffer = metadata
+        allocation = (
+            Allocation(descriptor, buffer) if use_summaries
+            else buffer.allocate_with_items(final_total, final_count, 2)
+        )
+        arena = buffer.data
         allocation_descriptor = allocation.descriptor
         descriptor = allocation.descriptor
-        # counts[0] and counts[1] are the final counts used by the buffered
-        # metadata layout; counts[2] and counts[3] are zeroed compaction
-        # accumulators.
+        storage = FallbackStorage(
+            tail=arena, count=final_count, lanes=arena, starts=arena,
+            blocks=blocks_out, descriptor=allocation_descriptor,
+            allocation=allocation_descriptor,
+        )
         final_counts = final_count
         bad_count = compact_count
         fallback_total = compact_total
     else:
         count, fallback_size = (int(value) for value in counts[:2].tolist())
-        bad_streams_out = torch.empty(count, dtype=torch.int32, device=source_values.device)
-        bad_starts_out = torch.empty(count, dtype=torch.uint8, device=source_values.device)
-        fallback_offsets_out = torch.empty(
-            count, dtype=torch.int32, device=source_values.device
+        lanes_out = torch.empty(count, dtype=torch.uint8, device=source_values.device)
+        starts_out = torch.empty(count, dtype=torch.uint8, device=source_values.device)
+        tail_buffer = torch.empty(
+            fallback_size, dtype=torch.uint8, device=source_values.device,
         )
-        fallback_buffer = torch.empty(
-            fallback_size, dtype=torch.int8, device=source_values.device
-        )
-        metadata_buffer = bad_streams_out
-        # Private compaction does not use the descriptor/final count path, so
-        # the zeroed counts[2] and counts[3] act as the atomic accumulators.
         allocation_descriptor = compact_count
         descriptor = None
         final_counts = compact_count
         bad_count = compact_count
         fallback_total = compact_total
+        storage = FallbackStorage(
+            tail=tail_buffer, count=bad_count, lanes=lanes_out,
+            starts=starts_out, blocks=blocks_out,
+            allocation=allocation_descriptor, base=0,
+        )
 
     if use_summaries:
-        _compact_metadata_kernel[(blocks,)](
-            extra_starts, summaries, counts, allocation_descriptor, metadata_buffer,
-            bad_streams_out, bad_starts_out, fallback_offsets_out,
-            blocks, streams, BUFFERED=buffered, N_LANES=lanes, N_STEPS=steps,
-            num_warps=4, num_stages=2,
-        )
         bad_count = final_count
         fallback_total = final_total
     else:
-        _compact_bad_streams(
-            extra_starts, bad_streams_out, bad_starts_out, fallback_offsets_out,
-            metadata_buffer, allocation_descriptor, final_counts,
-            bad_count, fallback_total, streams, steps,
-            buffered=buffered,
+        dispatch.compact_bad_streams(
+            extra_starts, storage, final_counts,
+            bad_count, fallback_total, streams, steps, blocks, buffered, lanes,
         )
-    _compact_extra(
-        source_values, bad_streams_out, bad_starts_out, fallback_offsets_out,
-        fallback_buffer, metadata_buffer, allocation_descriptor,
-        final_counts, bad_count, size, streams,
-        precomputed=precomputed, buffered=buffered,
-        logical_numel=logical_numel,
+    # The readers need the final stream count, not the pre-compaction
+    # accumulator the storage was built with a moment ago.
+    storage.count = final_count if buffered else bad_count
+    dispatch.compact_extra(
+        source_values, storage, final_counts, blocks, size,
+        precomputed=precomputed, buffered=buffered, logical_numel=logical_numel,
         block_symbols=block_symbols, lanes=lanes, steps=steps,
+        extra_starts=extra_starts, summaries=summaries, n_streams=streams,
+        build_meta=use_summaries,
     )
     return CompressedTensor(
         encoded, size, sign_mantissa,
-        offsets=None if buffered else bad_streams_out,
-        fallback_starts=None if buffered else bad_starts_out,
-        fallback_offsets=None if buffered else fallback_offsets_out,
-        fallback_buffer=fallback_buffer,
+        fallback_starts=None if buffered else storage.starts,
+        fallback_lanes=None if buffered else storage.lanes,
+        fallback_blocks=storage.blocks,
+        fallback_buffer=storage.tail,
         fallback_descriptor=descriptor,
         buffer=buffer,
-        fallback_count=final_count if buffered else bad_count,
+        fallback_count=storage.count,
         fallback_used=final_total if buffered else fallback_total,
-        distribution=distribution, center=center, shape=shape,
+        distribution=distribution, center=center, decode_table=shifted_decode,
+        shape=shape,
         layout=StorageLayout.COMPRESSED,
         stream_geometry=stream_geometry,
     )

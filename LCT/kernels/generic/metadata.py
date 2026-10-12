@@ -1,5 +1,9 @@
-"""Block summaries, prefix offsets, and GPU allocation for overflow storage."""
+"""Block summaries, prefix offsets, and GPU allocation for overflow storage.
 
+The compact fallback list is stored per storage block (see
+``LCT/kernels/generic/compaction.py``), so every consumer walks it one block at
+a time and needs no global offset array.
+"""
 import triton
 from triton import language as tl
 
@@ -27,40 +31,8 @@ def _prefix_allocate_kernel(
     tl.store(counts + out_idx, out)
     if BUFFERED:
         tl.debug_barrier()
+        # Two metadata bytes per overflowing stream: lane, then start step.
         _allocate_kernel(
             counts + 1, counts, descriptor, free_starts, free_sizes,
-            free_count, lock, generation, 16, 9, MAX_FREE_REGIONS,
+            free_count, lock, generation, 16, 2, MAX_FREE_REGIONS,
         )
-
-
-@triton.jit
-def _compact_metadata_kernel(
-    extra_starts, summaries, counts, descriptor, metadata,
-    streams_out, starts_out, offsets_out,
-    n_blocks, n_streams,
-    BUFFERED: tl.constexpr, N_LANES: tl.constexpr, N_STEPS: tl.constexpr,
-):
-    """Write disjoint block metadata using scan offsets instead of atomics."""
-    block = tl.program_id(0)
-    block_count = tl.load(summaries + block)
-    if block_count == 0:
-        return
-    lane = tl.arange(0, N_LANES)
-    stream = block * N_LANES + lane
-    start = tl.load(extra_starts + stream).to(tl.int32)
-    bad = (stream < n_streams) & (start != 255)
-    length = tl.where(bad, N_STEPS - start, 0)
-    rank = tl.cumsum(bad.to(tl.int32), axis=0) - bad.to(tl.int32)
-    local_offset = tl.cumsum(length, axis=0) - length
-    pos = tl.load(summaries + 2 * n_blocks + block) + rank
-    offset = tl.load(summaries + 3 * n_blocks + block) + local_offset
-    if BUFFERED:
-        count = tl.load(counts)
-        base = tl.load(descriptor)
-        tl.store(metadata + base // 4 + pos, stream, mask=bad)
-        tl.store(metadata + base // 4 + count + pos, offset, mask=bad)
-        tl.store(starts_out + base + 8 * count + pos, start, mask=bad)
-    else:
-        tl.store(streams_out + pos, stream, mask=bad)
-        tl.store(starts_out + pos, start, mask=bad)
-        tl.store(offsets_out + pos, offset, mask=bad)
