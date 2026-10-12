@@ -176,4 +176,15 @@ Coming soon.
 ## TODO
 
 - [ ] FP8 support
-- [ ] Optimise for more GPUs
+
+### GPU support
+
+All recent NVIDIA GPUs should be supported. However, GPU-specific autotuning configurations and kernels will be added to maximise performance. Tuning support list: 
+
+- [x] RTX 3090
+- [x] RTX 4090
+- [x] RTX 5090
+- [x] A100
+- [ ] H100
+- [ ] H200
+- [ ] B200
